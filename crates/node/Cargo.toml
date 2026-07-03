@@ -5,14 +5,23 @@ edition = "2021"
 description = "NAPI-RS binding. Translation only — logic belongs in beamsocket-core."
 
 [lib]
-# Phase 0 graduation: switch to cdylib and enable napi.
-# crate-type = ["cdylib"]
+# Phase 1A: cdylib is the Node addon; rlib keeps `cargo test --workspace`
+# linking the pure-Rust parts (wire format, buffer strategy) without Node
+# symbols. The napi surface only exists under `--features napi` (see below).
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The napi/TSFN binding surface. OFF by default so CI's `cargo test --workspace`
+# and `cargo clippy --workspace` never try to link Node symbols (napi_* is only
+# resolvable inside a Node process). The addon is built with:
+#   cargo build -p beamsocket-node --release --features napi
+default = []
+napi = ["dep:napi", "dep:napi-derive"]
 
 [dependencies]
 beamsocket-core = { path = "../core" }
-# Staged for Phase 0 graduation (the winning spike design moves in here):
-# napi = { version = "2", default-features = false, features = ["napi8", "async"] }
-# napi-derive = "2"
+napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
+napi-derive = { version = "2", optional = true }
 
 [build-dependencies]
-# napi-build = "2"
+napi-build = "2"

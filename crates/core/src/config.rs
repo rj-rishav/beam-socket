@@ -35,7 +35,10 @@ pub struct Backpressure {
 
 impl Default for Backpressure {
     fn default() -> Self {
-        Self { high_water_mark: 64 * 1024, policy: BackpressurePolicy::Disconnect }
+        Self {
+            high_water_mark: 64 * 1024,
+            policy: BackpressurePolicy::Disconnect,
+        }
     }
 }
 
