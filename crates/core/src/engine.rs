@@ -10,16 +10,18 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
+use crate::broadcast::{broadcast, FanoutReport, FanoutTarget};
 use crate::config::{Config, ConfigError};
 use crate::connection::backpressure::{Mailbox, OutboundFrame, PushOutcome};
 use crate::connection::registry::Registry;
 use crate::connection::{
-    run_connection, CloseCmd, CloseSignal, ConnCtx, ConnHandle, Control, CLOSE_BACKPRESSURE,
-    CLOSE_GOING_AWAY, CONTROL_QUEUE_CAPACITY,
+    run_connection, CloseSignal, ConnCtx, ConnHandle, CLOSE_BACKPRESSURE, CLOSE_GOING_AWAY,
+    CONTROL_QUEUE_CAPACITY,
 };
 use crate::events::{EngineEvent, EventSender};
-use crate::ids::ConnectionId;
+use crate::ids::{ConnectionId, RoomId};
 use crate::metrics::Metrics;
+use crate::rooms::{MembershipChange, RoomRegistry};
 use crate::transport::{Transport, WebSocketTransport};
 
 #[derive(Debug)]
@@ -62,6 +64,7 @@ pub enum SendStatus {
 pub struct Engine {
     runtime: Option<tokio::runtime::Runtime>,
     registry: Arc<Registry>,
+    rooms: Arc<RoomRegistry>,
     metrics: Arc<Metrics>,
     events: EventSender,
     config: Arc<Config>,
@@ -91,6 +94,7 @@ impl Engine {
             Self {
                 runtime: Some(runtime),
                 registry: Arc::new(Registry::new()),
+                rooms: Arc::new(RoomRegistry::new()),
                 metrics,
                 events,
                 config: Arc::new(config),
@@ -152,15 +156,75 @@ impl Engine {
             events: self.events.clone(),
         });
         let registry = self.registry.clone();
+        let rooms = self.rooms.clone();
         let shutdown_rx = self.shutdown_tx.subscribe();
         handle.spawn(accept_loop::<WebSocketTransport>(
             listener,
             ctx,
             registry,
+            rooms,
             shutdown_rx,
         ));
         *listening = true;
         Ok(actual)
+    }
+
+    // ── Phase 1B: rooms + broadcast (fan-out entirely in Rust, Rule 1) ──
+
+    /// Join a room (auto-created on first join). Sync JS→Rust call.
+    pub fn join(&self, id: ConnectionId, room: &str) -> MembershipChange {
+        self.rooms.join(&self.registry, id, RoomId(room.to_owned()))
+    }
+
+    /// Leave a room (auto-destroyed on last leave). Sync JS→Rust call.
+    pub fn leave(&self, id: ConnectionId, room: &str) -> MembershipChange {
+        self.rooms
+            .leave(&self.registry, id, &RoomId(room.to_owned()))
+    }
+
+    /// One FFI call per broadcast; the payload is ONE allocation, cloned by
+    /// refcount into each member's bounded mailbox (ENGINEERING.md §6).
+    pub fn broadcast_room(
+        &self,
+        room: &str,
+        data: bytes::Bytes,
+        is_binary: bool,
+        except: &[ConnectionId],
+    ) -> FanoutReport {
+        broadcast(
+            &self.registry,
+            &self.rooms,
+            FanoutTarget::Room(&RoomId(room.to_owned())),
+            data,
+            is_binary,
+            except,
+        )
+    }
+
+    /// Broadcast to every live connection.
+    pub fn broadcast_all(
+        &self,
+        data: bytes::Bytes,
+        is_binary: bool,
+        except: &[ConnectionId],
+    ) -> FanoutReport {
+        broadcast(
+            &self.registry,
+            &self.rooms,
+            FanoutTarget::All,
+            data,
+            is_binary,
+            except,
+        )
+    }
+
+    pub fn room_count(&self) -> usize {
+        self.rooms.room_count()
+    }
+
+    /// Membership size of one room (diagnostics/tests).
+    pub fn room_member_count(&self, room: &str) -> usize {
+        self.rooms.member_count(&RoomId(room.to_owned()))
     }
 
     /// JS→Rust hot path: synchronous, lock is per-shard + per-connection
@@ -173,7 +237,7 @@ impl Engine {
             PushOutcome::Queued => SendStatus::Queued,
             PushOutcome::DroppedNewest | PushOutcome::DroppedOldest => SendStatus::Backpressure,
             PushOutcome::Disconnect => {
-                close_handle(&handle, CLOSE_BACKPRESSURE, "backpressure", true);
+                handle.initiate_close(CLOSE_BACKPRESSURE, "backpressure", true);
                 SendStatus::Backpressure
             }
             PushOutcome::Closed => SendStatus::NotFound,
@@ -184,7 +248,7 @@ impl Engine {
     pub fn close_connection(&self, id: ConnectionId, code: u16, reason: &str) -> bool {
         match self.registry.get(id) {
             Some(handle) => {
-                close_handle(&handle, code, reason, true);
+                handle.initiate_close(code, reason, true);
                 true
             }
             None => false,
@@ -197,7 +261,7 @@ impl Engine {
     pub fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true); // accept loop exits
         for (_, handle) in self.registry.handles() {
-            close_handle(&handle, CLOSE_GOING_AWAY, "server shutting down", true);
+            handle.initiate_close(CLOSE_GOING_AWAY, "server shutting down", true);
         }
         if let Some(runtime) = self.runtime.take() {
             let registry = self.registry.clone();
@@ -213,23 +277,11 @@ impl Engine {
     }
 }
 
-fn close_handle(handle: &ConnHandle, code: u16, reason: &str, graceful: bool) {
-    // Watch first (cannot be lost), then the writer command (sends the frame).
-    handle.close.signal(CloseCmd {
-        code,
-        reason: reason.into(),
-        graceful,
-    });
-    let _ = handle.control.try_send(Control::Close {
-        code,
-        reason: reason.into(),
-    });
-}
-
 async fn accept_loop<T: Transport>(
     listener: TcpListener,
     ctx: Arc<ConnCtx>,
     registry: Arc<Registry>,
+    rooms: Arc<RoomRegistry>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -244,7 +296,12 @@ async fn accept_loop<T: Transport>(
                     let _ = tcp.set_nodelay(true);
                     // One isolated task per connection (tokio contains its
                     // panics; run_connection contains them WITH cleanup).
-                    tokio::spawn(setup_connection::<T>(tcp, ctx.clone(), registry.clone()));
+                    tokio::spawn(setup_connection::<T>(
+                        tcp,
+                        ctx.clone(),
+                        registry.clone(),
+                        rooms.clone(),
+                    ));
                 }
                 Err(_) => {
                     // Transient accept errors (e.g. EMFILE): don't spin.
@@ -259,6 +316,7 @@ async fn setup_connection<T: Transport>(
     tcp: TcpStream,
     ctx: Arc<ConnCtx>,
     registry: Arc<Registry>,
+    rooms: Arc<RoomRegistry>,
 ) {
     // Handshake failures never reach JS — the socket just goes away.
     let Ok((sink, source)) = T::accept(tcp, &ctx.config).await else {
@@ -281,6 +339,10 @@ async fn setup_connection<T: Transport>(
 
     run_connection(id, source, sink, handle, control_rx, close_rx, ctx.clone()).await;
 
-    registry.remove(id);
+    // Bidirectional membership cleanup: the entry (and its room set) comes
+    // out first, so no join can race the sweep — O(rooms) per §6.
+    if let Some((_, joined)) = registry.remove_full(id) {
+        rooms.disconnect_cleanup(id, joined);
+    }
     Metrics::sub(&ctx.metrics.connections, 1);
 }
