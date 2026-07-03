@@ -51,11 +51,13 @@ impl Transport for WebSocketTransport {
         io: TcpStream,
         config: &Config,
     ) -> Result<(Self::Sink, Self::Source), TransportError> {
-        let mut ws_cfg = WebSocketConfig::default();
         // Admission limit enforced in Rust before any JS runs: a frame or
         // message over the cap is rejected by the codec with close 1009.
-        ws_cfg.max_message_size = Some(config.limits.max_payload_bytes);
-        ws_cfg.max_frame_size = Some(config.limits.max_payload_bytes);
+        let ws_cfg = WebSocketConfig {
+            max_message_size: Some(config.limits.max_payload_bytes),
+            max_frame_size: Some(config.limits.max_payload_bytes),
+            ..Default::default()
+        };
 
         let ws = tokio_tungstenite::accept_async_with_config(io, Some(ws_cfg))
             .await
