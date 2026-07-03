@@ -9,3 +9,9 @@
 
 pub mod bridge;
 pub mod buffers;
+
+/// The #[napi] surface. Only exists under `--features napi` (the addon
+/// build); without it this crate is a plain rlib so `cargo test --workspace`
+/// stays link-clean (CI never resolves napi_* symbols outside Node).
+#[cfg(feature = "napi")]
+mod binding;

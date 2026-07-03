@@ -25,9 +25,20 @@ export interface Backpressure {
  */
 export type TrustProxy = boolean | string[];
 
+/**
+ * Server-side keepalive — runs entirely in Rust (Rule 1). The engine pings a
+ * connection idle for `pingIntervalMs`; no pong (nor any frame) within
+ * `pongTimeoutMs` tears the connection down (close event code 1006).
+ */
+export interface Keepalive {
+  pingIntervalMs?: number;
+  pongTimeoutMs?: number;
+}
+
 export interface BeamSocketConfig {
   limits?: Limits;
   backpressure?: Backpressure;
+  keepalive?: Keepalive;
   trustProxy?: TrustProxy;
 }
 

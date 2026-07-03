@@ -6,14 +6,16 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": ["dist", "native"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:native": "cargo build -p beamsocket-node --release --features napi && node scripts/copy-native.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test __tests__/"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "ws": "^8.18.0"
   }
 }
