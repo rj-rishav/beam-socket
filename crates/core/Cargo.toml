@@ -5,12 +5,14 @@ edition = "2021"
 description = "BeamSocket engine — the Rust data plane. Never imports NAPI."
 
 [dependencies]
-# Staged for Phase 1A (docs/ENGINEERING.md §5). Uncomment when the phase starts.
-# tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
-# tokio-tungstenite = "0.24"
+# Phase 1A (docs/ENGINEERING.md §5):
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-tungstenite = "0.24"
+slab = "0.4"
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+# Staged for Phase 1B (rooms — sharded registry):
 # dashmap = "6"
-# slab = "0.4"
-# bytes = "1"
 
 [dev-dependencies]
 # proptest = "1"      # Phase 1B property tests
