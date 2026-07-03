@@ -104,6 +104,24 @@ pub struct ConnHandle {
     pub close: Arc<CloseSignal>,
 }
 
+impl ConnHandle {
+    /// Initiate this connection's close: latch the reason (first signal
+    /// wins, cannot be lost) and nudge the writer to send the close frame
+    /// (`try_send` — if the tiny control queue is full, the latched watch
+    /// still tears the connection down at the grace deadline).
+    pub fn initiate_close(&self, code: u16, reason: &str, graceful: bool) {
+        self.close.signal(CloseCmd {
+            code,
+            reason: reason.into(),
+            graceful,
+        });
+        let _ = self.control.try_send(Control::Close {
+            code,
+            reason: reason.into(),
+        });
+    }
+}
+
 /// Everything a connection task shares with the engine.
 pub struct ConnCtx {
     pub config: Arc<Config>,

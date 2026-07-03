@@ -15,13 +15,14 @@
 //! per-connection structures themselves (mailbox, channels — counted in the
 //! connection-task budget, see PR notes).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use slab::Slab;
 
 use crate::connection::ConnHandle;
-use crate::ids::{ConnectionId, GENERATION_MASK};
+use crate::ids::{ConnectionId, RoomId, GENERATION_MASK};
 
 /// Power of two; shard = round-robin insert counter & (SHARDS-1).
 pub const SHARDS: usize = 16;
@@ -36,6 +37,10 @@ struct Shard {
 struct Entry {
     generation: u32,
     handle: ConnHandle,
+    /// conn→rooms side of the bidirectional membership (Phase 1B). Guarded
+    /// by the shard mutex, which serializes ALL membership changes for this
+    /// connection — see rooms.rs for the lock-order invariant.
+    rooms: HashSet<RoomId>,
 }
 
 pub struct Registry {
@@ -74,6 +79,7 @@ impl Registry {
         entry.insert(Entry {
             generation: 0, // fixed up below once we know the slot's generation
             handle,
+            rooms: HashSet::new(),
         });
         let generation = if key < shard.gens.len() {
             // Recycled slot: bump so stale IDs miss.
@@ -95,12 +101,38 @@ impl Registry {
     }
 
     pub fn remove(&self, id: ConnectionId) -> Option<ConnHandle> {
+        self.remove_full(id).map(|(handle, _)| handle)
+    }
+
+    /// Remove and hand back the conn→rooms set for O(rooms) disconnect
+    /// cleanup (rooms.rs::disconnect_cleanup). After this returns, joins for
+    /// `id` can no longer succeed, so the returned set is final.
+    pub fn remove_full(&self, id: ConnectionId) -> Option<(ConnHandle, HashSet<RoomId>)> {
         let mut shard = self.shards.get(id.shard() as usize)?.lock().unwrap();
         let entry = shard.slab.get(id.key() as usize)?;
         if entry.generation != id.generation() {
             return None;
         }
-        Some(shard.slab.remove(id.key() as usize).handle)
+        let entry = shard.slab.remove(id.key() as usize);
+        Some((entry.handle, entry.rooms))
+    }
+
+    /// Run `f` on the connection's room set under the shard lock — the
+    /// serializer for this connection's membership. Returns None for a
+    /// missing/stale id. Lock-order invariant (rooms.rs): `f` MAY touch the
+    /// room map (conn-shard → room-map); nothing may take these locks in the
+    /// reverse order.
+    pub fn with_rooms<R>(
+        &self,
+        id: ConnectionId,
+        f: impl FnOnce(&mut HashSet<RoomId>) -> R,
+    ) -> Option<R> {
+        let mut shard = self.shards.get(id.shard() as usize)?.lock().unwrap();
+        let entry = shard.slab.get_mut(id.key() as usize)?;
+        if entry.generation != id.generation() {
+            return None;
+        }
+        Some(f(&mut entry.rooms))
     }
 
     pub fn len(&self) -> usize {
