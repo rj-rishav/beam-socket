@@ -1,0 +1,4 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/node"]
+# spike/ is its own workspace on purpose: throwaway-grade code, separate lockfile.

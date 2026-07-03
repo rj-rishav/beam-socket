@@ -1,0 +1,16 @@
+[package]
+name = "bridge-node"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+napi = { version = "2", default-features = false, features = ["napi8", "async"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"

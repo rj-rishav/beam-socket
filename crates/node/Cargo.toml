@@ -1,0 +1,18 @@
+[package]
+name = "beamsocket-node"
+version = "0.0.0"
+edition = "2021"
+description = "NAPI-RS binding. Translation only — logic belongs in beamsocket-core."
+
+[lib]
+# Phase 0 graduation: switch to cdylib and enable napi.
+# crate-type = ["cdylib"]
+
+[dependencies]
+beamsocket-core = { path = "../core" }
+# Staged for Phase 0 graduation (the winning spike design moves in here):
+# napi = { version = "2", default-features = false, features = ["napi8", "async"] }
+# napi-derive = "2"
+
+[build-dependencies]
+# napi-build = "2"

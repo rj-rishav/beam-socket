@@ -1,0 +1,17 @@
+[package]
+name = "beamsocket-core"
+version = "0.0.0"
+edition = "2021"
+description = "BeamSocket engine — the Rust data plane. Never imports NAPI."
+
+[dependencies]
+# Staged for Phase 1A (docs/ENGINEERING.md §5). Uncomment when the phase starts.
+# tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+# tokio-tungstenite = "0.24"
+# dashmap = "6"
+# slab = "0.4"
+# bytes = "1"
+
+[dev-dependencies]
+# proptest = "1"      # Phase 1B property tests
+# criterion = "0.5"   # micro-benchmarks

@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["bridge-core", "bridge-node"]
+# Separate workspace from the repo root ON PURPOSE: this code is
+# throwaway-grade (RFC 0001 §8). Only the winning design's logic and
+# constants graduate into crates/node.

@@ -1,0 +1,7 @@
+target/
+node_modules/
+dist/
+*.node
+spike/results/
+npm-debug.log*
+.DS_Store

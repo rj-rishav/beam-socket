@@ -1,0 +1,10 @@
+{
+  "name": "beamsocket-monorepo",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "npm run build -w beamsocket",
+    "test": "npm run test -w beamsocket",
+    "typecheck": "npm run typecheck -w beamsocket"
+  }
+}
