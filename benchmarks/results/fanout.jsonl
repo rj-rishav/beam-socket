@@ -1,0 +1,11 @@
+{"server":"beamsocket","node":"v20.19.5","members":5000,"payload":512,"connectMs":2569,"rssBaseMB":46.5,"rssLoadedMB":108.3,"rssPerConnKB":12.66,"fanoutMs":[51,90,70,46,53],"fanoutBestMs":46,"fanoutMedianMs":53}
+{"server":"ws","node":"v20.19.5","members":5000,"payload":512,"connectMs":1500,"rssBaseMB":53.4,"rssLoadedMB":93.4,"rssPerConnKB":8.2,"fanoutMs":[71,100,49,40,42],"fanoutBestMs":40,"fanoutMedianMs":49}
+{"server":"uws","node":"v20.19.5","members":5000,"payload":512,"connectMs":554,"rssBaseMB":46.3,"rssLoadedMB":53.6,"rssPerConnKB":1.5,"fanoutMs":[49,63,79,40,46],"fanoutBestMs":40,"fanoutMedianMs":49}
+{"server":"socketio","node":"v20.19.5","members":5000,"payload":512,"connectMs":3016,"rssBaseMB":55.2,"rssLoadedMB":136.1,"rssPerConnKB":16.56,"fanoutMs":[202,187,159,149,148],"fanoutBestMs":148,"fanoutMedianMs":159}
+{"server":"beamsocket","node":"v20.19.5","members":10000,"payload":512,"connectMs":6916,"rssBaseMB":46.5,"rssLoadedMB":160.4,"rssPerConnKB":11.67,"fanoutMs":[108,92,93,81,90],"fanoutBestMs":81,"fanoutMedianMs":92}
+{"server":"ws","node":"v20.19.5","members":10000,"payload":512,"connectMs":3808,"rssBaseMB":53.4,"rssLoadedMB":114.4,"rssPerConnKB":6.25,"fanoutMs":[134,88,96,87,88],"fanoutBestMs":87,"fanoutMedianMs":88}
+{"server":"uws","node":"v20.19.5","members":10000,"payload":512,"connectMs":993,"rssBaseMB":46.3,"rssLoadedMB":57.2,"rssPerConnKB":1.12,"fanoutMs":[104,78,76,92,84],"fanoutBestMs":76,"fanoutMedianMs":84}
+{"server":"socketio","node":"v20.19.5","members":10000,"payload":512,"connectMs":3632,"rssBaseMB":55,"rssLoadedMB":198.8,"rssPerConnKB":14.73,"fanoutMs":[353,296,277,264,249],"fanoutBestMs":249,"fanoutMedianMs":277}
+{"server":"beamsocket","node":"v20.19.5","members":25000,"payload":512,"connectMs":6686,"rssBaseMB":46.2,"rssLoadedMB":321.7,"rssPerConnKB":11.29,"fanoutMs":[211,188,147,163,140],"fanoutBestMs":140,"fanoutMedianMs":163}
+{"server":"ws","node":"v20.19.5","members":25000,"payload":512,"connectMs":8870,"rssBaseMB":53.6,"rssLoadedMB":161.3,"rssPerConnKB":4.41,"fanoutMs":[302,246,240,256,217],"fanoutBestMs":217,"fanoutMedianMs":246}
+{"server":"uws","node":"v20.19.5","members":25000,"payload":512,"connectMs":5201,"rssBaseMB":46.3,"rssLoadedMB":66.9,"rssPerConnKB":0.84,"fanoutMs":[295,315,285,268,278],"fanoutBestMs":268,"fanoutMedianMs":285}
