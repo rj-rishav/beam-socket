@@ -43,11 +43,11 @@ impl FrameSource for MockSource {
     }
 }
 
-struct MockSink(mpsc::UnboundedSender<OutFrame>); // test-only collector, not runtime code
+struct MockSink(mpsc::Sender<OutFrame>); // bounded, like everything (Rule 5)
 
 impl FrameSink for MockSink {
     async fn send_frame(&mut self, frame: OutFrame) -> Result<(), TransportError> {
-        let _ = self.0.send(frame);
+        let _ = self.0.try_send(frame); // tests never fill the collector
         Ok(())
     }
 
@@ -56,14 +56,14 @@ impl FrameSink for MockSink {
 
 struct MockConn {
     feed: mpsc::Sender<Feed>,
-    written: mpsc::UnboundedReceiver<OutFrame>,
+    written: mpsc::Receiver<OutFrame>,
     handle: ConnHandle,
     task: tokio::task::JoinHandle<(u16, String)>,
 }
 
 fn spawn_mock_conn(id: u64, ctx: Arc<ConnCtx>) -> MockConn {
     let (feed_tx, feed_rx) = mpsc::channel(64);
-    let (written_tx, written_rx) = mpsc::unbounded_channel();
+    let (written_tx, written_rx) = mpsc::channel(1024);
     let mailbox = Mailbox::new(
         ctx.config.backpressure.high_water_mark,
         ctx.config.backpressure.policy,

@@ -12,6 +12,9 @@ jobs:
         with: { components: "rustfmt, clippy" }
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace -- -D warnings
+      # The napi surface only compiles under --features napi (kept out of the
+      # default build so test binaries never link Node symbols); lint it too.
+      - run: cargo clippy -p beamsocket-node --features napi -- -D warnings
       - run: cargo test --workspace
       # Spike is its own workspace:
       - run: cargo test --manifest-path spike/Cargo.toml --workspace
@@ -25,5 +28,55 @@ jobs:
       - run: npm ci --workspaces --include-workspace-root
       - run: npm run typecheck
 
-  # Phase 1A adds: Autobahn protocol suite (Docker) + JS integration tests.
+  # JS integration: stock `ws` client echoes through the real addon
+  # (ENGINEERING.md §5 required test).
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci --workspaces --include-workspace-root
+      - run: npm run build:native -w beamsocket
+      - run: npm run build -w beamsocket
+      - run: npm test -w beamsocket
+
+  # Protocol correctness (Phase 1A exit gate): Autobahn fuzzingclient against
+  # the echo example. permessage-deflate cases (12.*/13.*) excluded — the
+  # extension is off in Phase 1. Runs here because dev sandboxes often lack a
+  # Docker daemon; a green run on this job (or the pinned reference box) is
+  # the gate, never a local claim.
+  autobahn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci --workspaces --include-workspace-root
+      - run: npm run build:native -w beamsocket
+      - run: npm run build -w beamsocket
+      - name: Start echo server
+        run: |
+          PORT=9001 BEAMSOCKET_MAX_PAYLOAD=67108864 node examples/echo/server.mjs &
+          for i in $(seq 1 50); do
+            node -e "const s=require('net').connect(9001,'127.0.0.1');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1))" && break
+            sleep 0.2
+          done
+      - name: Run Autobahn fuzzingclient
+        run: |
+          docker run --rm --network host \
+            -v ${{ github.workspace }}/.github/autobahn:/config \
+            -v ${{ github.workspace }}/.github/autobahn/reports:/config/reports \
+            crossbario/autobahn-testsuite \
+            wstest -m fuzzingclient -s /config/fuzzingclient.json
+      - name: Check results
+        run: node .github/autobahn/check-results.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: autobahn-reports
+          path: .github/autobahn/reports
+
   # Phase 1D adds: napi-rs prebuild matrix.
