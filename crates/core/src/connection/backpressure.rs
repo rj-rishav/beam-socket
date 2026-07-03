@@ -15,15 +15,17 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use tokio::sync::Notify;
 
 use crate::config::BackpressurePolicy;
 use crate::metrics::Metrics;
 
-/// An outbound item for the writer task.
-#[derive(Debug)]
+/// An outbound item for the writer task. `data` is refcounted: a broadcast
+/// enqueues N clones of ONE allocation (ENGINEERING.md §6).
+#[derive(Debug, Clone)]
 pub struct OutboundFrame {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub is_binary: bool,
 }
 
@@ -172,7 +174,7 @@ mod tests {
 
     fn frame(n: usize) -> OutboundFrame {
         OutboundFrame {
-            data: vec![0u8; n],
+            data: Bytes::from(vec![0u8; n]),
             is_binary: true,
         }
     }

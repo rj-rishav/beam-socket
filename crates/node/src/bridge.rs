@@ -247,17 +247,17 @@ mod tests {
             },
             EngineEvent::Message {
                 id: ConnectionId(1),
-                payload: b"hello".to_vec(),
+                payload: bytes::Bytes::from_static(b"hello"),
                 is_binary: false,
             },
             EngineEvent::Message {
                 id: ConnectionId(9_999_999_999),
-                payload: vec![0u8; 4096],
+                payload: bytes::Bytes::from(vec![0u8; 4096]),
                 is_binary: true,
             },
             EngineEvent::Message {
                 id: ConnectionId(0),
-                payload: Vec::new(),
+                payload: bytes::Bytes::new(),
                 is_binary: false,
             },
             EngineEvent::ConnectionClosed {
@@ -341,7 +341,7 @@ mod tests {
         for i in 0..(BRIDGE_BATCH + 3) as u64 {
             tx.send(EngineEvent::Message {
                 id: ConnectionId(i),
-                payload: b"x".to_vec(),
+                payload: bytes::Bytes::from_static(b"x"),
                 is_binary: false,
             })
             .await

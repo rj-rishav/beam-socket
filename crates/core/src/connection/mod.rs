@@ -54,7 +54,7 @@ pub const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// the close watch, which cannot be lost.
 #[derive(Debug)]
 pub enum Control {
-    Ping(Vec<u8>),
+    Ping(bytes::Bytes),
     Close { code: u16, reason: String },
 }
 
@@ -212,16 +212,12 @@ async fn write_loop<Snk: FrameSink>(
                 Some(_) if close_sent => {}
                 Some(OutboundFrame { data, is_binary }) => {
                     let len = data.len() as u64;
+                    // UTF-8 validation for text frames lives in the sink
+                    // (zero-copy check, binary fallback on caller bug).
                     let out = if is_binary {
                         OutFrame::Binary(data)
                     } else {
-                        // JS strings arrive as valid UTF-8; a non-UTF-8 "text"
-                        // send is a caller bug — fall back to binary rather
-                        // than poison the connection.
-                        match String::from_utf8(data) {
-                            Ok(s) => OutFrame::Text(s),
-                            Err(e) => OutFrame::Binary(e.into_bytes()),
-                        }
+                        OutFrame::Text(data)
                     };
                     if sink.send_frame(out).await.is_err() {
                         break;
@@ -296,7 +292,7 @@ async fn read_loop<Src: FrameSource>(
                     Metrics::add(&ctx.metrics.messages_in, 1);
                     Metrics::add(&ctx.metrics.bytes_in, s.len() as u64);
                     // Hot path: drop-newest into the bounded bridge queue.
-                    ctx.events.try_message(id, s.into_bytes(), false);
+                    ctx.events.try_message(id, s, false);
                 }
                 Some(Ok(InFrame::Binary(b))) => {
                     last_activity = Instant::now();
@@ -325,7 +321,7 @@ async fn read_loop<Src: FrameSource>(
                 if Instant::now().duration_since(last_activity) >= keepalive.ping_interval
                     && pong_deadline.is_none()
                 {
-                    let _ = handle.control.try_send(Control::Ping(Vec::new()));
+                    let _ = handle.control.try_send(Control::Ping(bytes::Bytes::new()));
                     pong_deadline = Some(Instant::now() + keepalive.pong_timeout);
                 }
             }

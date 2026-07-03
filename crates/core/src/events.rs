@@ -18,6 +18,7 @@
 
 use crate::ids::ConnectionId;
 use crate::metrics::Metrics;
+use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -25,10 +26,11 @@ use tokio::sync::mpsc;
 pub enum EngineEvent {
     /// A connection passed admission + authorize and is live. (Phase 1A)
     ConnectionOpened { id: ConnectionId },
-    /// App subscribed to `message` on this connection. (Phase 1A)
+    /// App subscribed to `message` on this connection. (Phase 1A; payload is
+    /// a refcounted view of the codec read buffer since 1B — no copy here.)
     Message {
         id: ConnectionId,
-        payload: Vec<u8>,
+        payload: Bytes,
         is_binary: bool,
     },
     /// Close handshake finished or connection dropped. (Phase 1A)
@@ -59,7 +61,7 @@ impl EventSender {
 
     /// Hot path: drop-newest on a full queue, counted, never silent.
     #[inline]
-    pub fn try_message(&self, id: ConnectionId, payload: Vec<u8>, is_binary: bool) {
+    pub fn try_message(&self, id: ConnectionId, payload: Bytes, is_binary: bool) {
         match self.tx.try_send(EngineEvent::Message {
             id,
             payload,
@@ -93,9 +95,9 @@ mod tests {
     async fn message_overflow_drops_newest_and_counts() {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = EventSender::bounded(2, metrics.clone());
-        tx.try_message(ConnectionId(1), b"a".to_vec(), false);
-        tx.try_message(ConnectionId(2), b"b".to_vec(), false);
-        tx.try_message(ConnectionId(3), b"c".to_vec(), false); // full → dropped
+        tx.try_message(ConnectionId(1), Bytes::from_static(b"a"), false);
+        tx.try_message(ConnectionId(2), Bytes::from_static(b"b"), false);
+        tx.try_message(ConnectionId(3), Bytes::from_static(b"c"), false); // full → dropped
         assert_eq!(Metrics::get(&metrics.bridge_dropped), 1);
 
         // The two oldest survived (drop-newest, not drop-oldest).
@@ -115,7 +117,7 @@ mod tests {
         let (tx, mut rx) = EventSender::bounded(1, metrics.clone());
         // Fill the queue, then send a control event concurrently: it must
         // arrive once the consumer makes room — never be dropped.
-        tx.try_message(ConnectionId(1), vec![], false);
+        tx.try_message(ConnectionId(1), Bytes::new(), false);
         let tx2 = tx.clone();
         let sender = tokio::spawn(async move {
             tx2.control(EngineEvent::ConnectionClosed {
