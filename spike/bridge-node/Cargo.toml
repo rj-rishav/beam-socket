@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
+bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 napi = { version = "2", default-features = false, features = ["napi8", "async"] }
 napi-derive = "2"

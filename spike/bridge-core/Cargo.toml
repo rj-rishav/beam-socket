@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 bytes = "1"
+libc = "0.2"
