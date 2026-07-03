@@ -135,6 +135,9 @@ Required tests:
 - **Integration (JS):** connect with the `ws` client package, echo text and binary, clean close both directions.
 - **Protocol:** Autobahn test suite green (excluding compression cases — permessage-deflate is off in Phase 1).
 - **Informational:** RSS with 10k idle connections, recorded in the PR (target context: <20 KB/conn).
+- **Informational:** JS→Rust call microbench (`send`/`join` napi call cost) — the cheap follow-up accepted in `0001-results.md` §"JS→Rust direction".
+
+Housekeeping allowed at phase start (pre-approved, separate commit): fix the two `cargo fmt` findings in the scaffold stubs; flip `crates/node` to `cdylib` + enable the napi deps (documented first step).
 
 ### Definition of done
 
@@ -217,6 +220,7 @@ Required tests:
 - Presence agrees with room membership after churn (property test shared with 1B).
 - `close()` drains: in-flight writes complete; new connections rejected during drain; process exits cleanly.
 - **Soak:** 10 minutes at 80% ceiling — flat RSS, no GC growth, no counter drift.
+- **Constant re-confirmation (release blocker):** re-run the RFC 0001 harness on the pinned reference box with the full 10-minute gate (`--gate-seconds 600`) — Phase 0 numbers came from a shared sandbox with ~2× run variance. Confirm the ≤2 ms p99 gate clears outright and lock `BRIDGE_BATCH`, `BRIDGE_FLUSH_INTERVAL`, and `EXTERNAL_BUFFER_THRESHOLD` (per `0001-results.md` §"Follow-ups").
 - Install test: `npm install` of the packed tarball on each prebuild platform runs the echo example.
 
 ### Definition of done

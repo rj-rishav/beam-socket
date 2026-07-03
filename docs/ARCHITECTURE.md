@@ -85,8 +85,8 @@ Each connection is an isolated lightweight task (Tokio task ≈ BEAM process): o
 
 Thin by design — translation only, no logic:
 
-- **Event bridge:** drains the core's event channel, batches into a preallocated buffer, flushes via one `ThreadsafeFunction` call. Flush triggers: batch size threshold (default 256) or 1 ms timer, whichever first.
-- **Buffer handoff:** inbound binary frames become external-backed `Buffer`s (zero-copy; Rust allocation freed by GC finalizer). Outbound JS buffers are copied once into `Bytes` at the boundary — the single unavoidable copy, since Rust can't safely hold GC-managed memory across await points.
+- **Event bridge:** drains the core's event channel, encodes events into **one contiguous flush buffer** (RFC 0001 winning design C — "batched flat encoding"), delivers it via one `ThreadsafeFunction` call per flush; JS decodes with a cursor reader into zero-copy subarray views (zero per-message allocation). Flush triggers: batch of 256 or 1 ms timer, whichever first — both validated by the RFC 0001 sweep. The originally proposed array-of-objects design was **refuted** by measurement (capped ~250 k events/s vs C's 1.35 M+; see `docs/rfcs/0001-results.md`).
+- **Buffer handoff:** external (zero-copy) buffers at/above the measured **16 KB threshold**, copy into V8 below it (GC-finalizer cost dominates small externals — RFC 0001 crossover data). Design C's per-flush buffers exceed the threshold in practice, so flushes are external and per-message data reaches handlers as subarray views. Outbound JS buffers are copied once into `Bytes` at the boundary — the single unavoidable copy, since Rust can't safely hold GC-managed memory across await points.
 - **Command surface:** flat `#[napi]` functions taking primitive IDs, not object graphs. Keeps FFI marshaling trivial.
 
 ### 2.3 `beamsocket` (npm package, TypeScript SDK)
@@ -247,7 +247,7 @@ Design notes:
 
 **Known cost accepted:** every app-bound message pays one FFI hop and one Buffer allocation. Apps that subscribe to `message` on 500k sockets are fundamentally JS-bound; the docs must be honest that BeamSocket's wins concentrate in fan-out-heavy and connection-heavy workloads.
 
-**The JS ceiling, stated plainly (this sentence ships in the public docs):** *BeamSocket optimizes connection management, routing, broadcasting, and networking workloads. Applications that execute substantial JavaScript per message remain limited by Node.js execution characteristics.* "Fully utilize all CPU cores" is true of the Rust plane only — application callbacks run on one event loop.
+**The JS ceiling, stated plainly (this sentence ships in the public docs):** *BeamSocket optimizes connection management, routing, broadcasting, and networking workloads. Applications that execute substantial JavaScript per message remain limited by Node.js execution characteristics.* "Fully utilize all CPU cores" is true of the Rust plane only — application callbacks run on one event loop. Now measured, not just asserted: with a realistic `JSON.parse`+`stringify` handler, all bridge designs converge at **~75–100 k events/s per subscribed stream** — the handler, not the bridge, is the wall (RFC 0001 results, "JSON handler" section). The bridge's 5–7× advantage accrues to light handlers and to everything that never enters JS at all.
 
 ---
 

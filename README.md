@@ -4,7 +4,7 @@
 
 Rust data plane, JavaScript control plane. Maximum connections, minimum overhead.
 
-**Status:** pre-alpha — Phase 0 (event bridge spike). See the roadmap.
+**Status:** pre-alpha — Phase 1A (echo server). Phase 0 gate met: RFC 0001 [results](docs/rfcs/0001-results.md) — Design C graduated.
 
 | Doc | Purpose |
 |---|---|
