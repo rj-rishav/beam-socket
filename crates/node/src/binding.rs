@@ -173,7 +173,7 @@ impl BeamEngine {
         let engine = self.engine()?;
         Ok(status_code(engine.send(
             conn_id(id_hi, id_lo),
-            data.to_vec(),
+            bytes::Bytes::from(data.to_vec()),
             is_binary,
         )))
     }
@@ -184,7 +184,7 @@ impl BeamEngine {
         let engine = self.engine()?;
         Ok(status_code(engine.send(
             conn_id(id_hi, id_lo),
-            data.into_bytes(),
+            bytes::Bytes::from(data.into_bytes()),
             false,
         )))
     }

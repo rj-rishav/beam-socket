@@ -7,11 +7,18 @@
 //! connection task (connection/mod.rs) is generic over these traits, which is
 //! also what lets unit tests inject mock (and deliberately panicking)
 //! transports without a socket.
+//!
+//! Payloads are `bytes::Bytes` in BOTH directions (Phase 1B): inbound frames
+//! borrow the codec's read buffer refcount instead of copying; outbound
+//! frames are refcounted so a broadcast enqueues N handle clones of ONE
+//! allocation (ENGINEERING.md §6).
 
 use std::future::Future;
 
-use crate::config::Config;
+use bytes::Bytes;
 use tokio::net::TcpStream;
+
+use crate::config::Config;
 
 /// A frame arriving from the peer, already decoded by the transport.
 /// Ping is intentionally absent: replying to pings is codec bookkeeping and
@@ -19,8 +26,9 @@ use tokio::net::TcpStream;
 /// business either).
 #[derive(Debug)]
 pub enum InFrame {
-    Text(String),
-    Binary(Vec<u8>),
+    /// UTF-8 validated by the codec.
+    Text(Bytes),
+    Binary(Bytes),
     /// Peer answered a keepalive ping (or sent an unsolicited pong).
     Pong,
     /// Peer initiated (or acknowledged) the close handshake.
@@ -33,10 +41,15 @@ pub enum InFrame {
 /// A frame the engine asks the transport to write.
 #[derive(Debug)]
 pub enum OutFrame {
-    Text(String),
-    Binary(Vec<u8>),
-    Ping(Vec<u8>),
-    Close { code: u16, reason: String },
+    /// Must be valid UTF-8 (JS strings always are); the WebSocket transport
+    /// re-validates and falls back to Binary rather than poison the stream.
+    Text(Bytes),
+    Binary(Bytes),
+    Ping(Bytes),
+    Close {
+        code: u16,
+        reason: String,
+    },
 }
 
 /// Transport-level failure. `close_code` is what we *report* to the app

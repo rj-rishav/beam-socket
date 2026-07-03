@@ -157,7 +157,9 @@ async fn panicking_connection_task_is_contained() {
     // The runtime and the OTHER connection are unaffected: it still reads…
     survivor
         .feed
-        .send(Feed::Frame(InFrame::Text("still alive".into())))
+        .send(Feed::Frame(InFrame::Text(bytes::Bytes::from_static(
+            b"still alive",
+        ))))
         .await
         .unwrap();
     let ev = recv_until(
@@ -169,7 +171,7 @@ async fn panicking_connection_task_is_contained() {
         EngineEvent::Message {
             payload, is_binary, ..
         } => {
-            assert_eq!(payload, b"still alive");
+            assert_eq!(payload.as_ref(), b"still alive");
             assert!(!is_binary);
         }
         _ => unreachable!(),
@@ -179,7 +181,7 @@ async fn panicking_connection_task_is_contained() {
         .handle
         .mailbox
         .push(beamsocket_core::connection::backpressure::OutboundFrame {
-            data: b"echo".to_vec(),
+            data: bytes::Bytes::from_static(b"echo"),
             is_binary: true,
         });
     match tokio::time::timeout(Duration::from_secs(5), survivor.written.recv())
@@ -187,7 +189,7 @@ async fn panicking_connection_task_is_contained() {
         .unwrap()
         .unwrap()
     {
-        OutFrame::Binary(b) => assert_eq!(b, b"echo"),
+        OutFrame::Binary(b) => assert_eq!(b.as_ref(), b"echo"),
         other => panic!("expected binary frame, got {other:?}"),
     }
 }
@@ -287,12 +289,14 @@ fn engine_echoes_and_closes_cleanly_both_directions() {
             ws.next().await.unwrap().unwrap(),
             Message::Text("hello".into())
         );
-        ws.send(Message::Binary(vec![1, 2, 3, 0, 255]))
-            .await
-            .unwrap();
+        ws.send(Message::Binary(bytes::Bytes::from_static(&[
+            1, 2, 3, 0, 255,
+        ])))
+        .await
+        .unwrap();
         assert_eq!(
             ws.next().await.unwrap().unwrap(),
-            Message::Binary(vec![1, 2, 3, 0, 255])
+            Message::Binary(bytes::Bytes::from_static(&[1, 2, 3, 0, 255]))
         );
         // Client initiates the close handshake; the server must ack.
         ws.close(Some(CloseFrame {

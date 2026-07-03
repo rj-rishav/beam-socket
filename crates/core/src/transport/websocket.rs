@@ -1,4 +1,4 @@
-//! WebSocket transport — Phase 1A.
+//! WebSocket transport — Phase 1A (payloads Bytes-refcounted since 1B).
 //!
 //! Codec: tokio-tungstenite first (correctness, Autobahn-proven), behind the
 //! `Transport` trait so a fastwebsockets swap stays contained here
@@ -13,16 +13,24 @@
 //! the RFC-correct close frames on the wire. The engine only sees the
 //! transport-neutral `InFrame`/`TransportError` view.
 
+use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::config::Config;
 use crate::transport::{FrameSink, FrameSource, InFrame, OutFrame, Transport, TransportError};
+
+/// Initial codec read-buffer size. tungstenite's default (128 KiB) is tuned
+/// for throughput on few sockets; BeamSocket's density target wants small
+/// initial buffers that grow on demand (ARCHITECTURE.md §5: "tune read
+/// buffers to 4 KB initial"). Re-validated by the 10k-idle RSS gate.
+const READ_BUFFER_SIZE: usize = 4 * 1024;
 
 pub struct WebSocketTransport;
 
@@ -33,7 +41,7 @@ fn map_err(e: WsError) -> TransportError {
     let (close_code, message) = match &e {
         WsError::Capacity(_) => (1009, e.to_string()),
         WsError::Protocol(_) => (1002, e.to_string()),
-        WsError::Utf8 => (1007, e.to_string()),
+        WsError::Utf8(_) => (1007, e.to_string()),
         // Includes Io, AlreadyClosed, ConnectionClosed after an unclean drop…
         _ => (1006, e.to_string()),
     };
@@ -53,11 +61,10 @@ impl Transport for WebSocketTransport {
     ) -> Result<(Self::Sink, Self::Source), TransportError> {
         // Admission limit enforced in Rust before any JS runs: a frame or
         // message over the cap is rejected by the codec with close 1009.
-        let ws_cfg = WebSocketConfig {
-            max_message_size: Some(config.limits.max_payload_bytes),
-            max_frame_size: Some(config.limits.max_payload_bytes),
-            ..Default::default()
-        };
+        let ws_cfg = WebSocketConfig::default()
+            .max_message_size(Some(config.limits.max_payload_bytes))
+            .max_frame_size(Some(config.limits.max_payload_bytes))
+            .read_buffer_size(READ_BUFFER_SIZE);
 
         let ws = tokio_tungstenite::accept_async_with_config(io, Some(ws_cfg))
             .await
@@ -71,7 +78,9 @@ impl FrameSource for WsSource {
     async fn next_frame(&mut self) -> Option<Result<InFrame, TransportError>> {
         loop {
             match self.0.next().await? {
-                Ok(Message::Text(s)) => return Some(Ok(InFrame::Text(s))),
+                // Utf8Bytes → Bytes is a refcount move, not a copy; validity
+                // was already checked by the codec.
+                Ok(Message::Text(s)) => return Some(Ok(InFrame::Text(Bytes::from(s)))),
                 Ok(Message::Binary(b)) => return Some(Ok(InFrame::Binary(b))),
                 // tungstenite already queued the Pong (codec bookkeeping);
                 // pings otherwise carry no engine-visible information.
@@ -79,7 +88,9 @@ impl FrameSource for WsSource {
                 Ok(Message::Pong(_)) => return Some(Ok(InFrame::Pong)),
                 Ok(Message::Close(frame)) => {
                     let (code, reason) = match frame {
-                        Some(CloseFrame { code, reason }) => (u16::from(code), reason.into_owned()),
+                        Some(CloseFrame { code, reason }) => {
+                            (u16::from(code), reason.as_str().to_owned())
+                        }
                         None => (1005, String::new()), // no status present
                     };
                     return Some(Ok(InFrame::Close { code, reason }));
@@ -96,7 +107,14 @@ impl FrameSource for WsSource {
 impl FrameSink for WsSink {
     async fn send_frame(&mut self, frame: OutFrame) -> Result<(), TransportError> {
         let msg = match frame {
-            OutFrame::Text(s) => Message::Text(s),
+            // The clone is a refcount bump; Utf8Bytes wraps the SAME
+            // allocation on success (zero-copy validation).
+            OutFrame::Text(b) => match Utf8Bytes::try_from(b.clone()) {
+                Ok(s) => Message::Text(s),
+                // JS strings are always valid UTF-8; this is a non-JS caller
+                // bug — degrade to binary rather than poison the connection.
+                Err(_) => Message::Binary(b),
+            },
             OutFrame::Binary(b) => Message::Binary(b),
             OutFrame::Ping(p) => Message::Ping(p),
             OutFrame::Close { code, reason } => Message::Close(Some(CloseFrame {

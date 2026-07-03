@@ -165,7 +165,7 @@ impl Engine {
 
     /// JS→Rust hot path: synchronous, lock is per-shard + per-connection
     /// (Rule 2), never blocks on IO.
-    pub fn send(&self, id: ConnectionId, data: Vec<u8>, is_binary: bool) -> SendStatus {
+    pub fn send(&self, id: ConnectionId, data: bytes::Bytes, is_binary: bool) -> SendStatus {
         let Some(handle) = self.registry.get(id) else {
             return SendStatus::NotFound;
         };

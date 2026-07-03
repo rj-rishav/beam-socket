@@ -7,13 +7,15 @@ description = "BeamSocket engine — the Rust data plane. Never imports NAPI."
 [dependencies]
 # Phase 1A (docs/ENGINEERING.md §5):
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
-tokio-tungstenite = "0.24"
+# 0.26+ carries payloads as refcounted Bytes end-to-end — required for the
+# Phase 1B one-allocation broadcast contract (ENGINEERING.md §6).
+tokio-tungstenite = "0.29"
 slab = "0.4"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
-# Staged for Phase 1B (rooms — sharded registry):
-# dashmap = "6"
+# Phase 1B (rooms — sharded registry):
+dashmap = "6"
 
 [dev-dependencies]
-# proptest = "1"      # Phase 1B property tests
+proptest = "1" # Phase 1B membership property tests
 # criterion = "0.5"   # micro-benchmarks

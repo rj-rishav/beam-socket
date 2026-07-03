@@ -20,6 +20,7 @@ napi = ["dep:napi", "dep:napi-derive"]
 
 [dependencies]
 beamsocket-core = { path = "../core" }
+bytes = "1"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
 napi-derive = { version = "2", optional = true }
