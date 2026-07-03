@@ -10,10 +10,12 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use beamsocket_core::broadcast::FanoutReport;
 use beamsocket_core::config::{BackpressurePolicy, Config};
 use beamsocket_core::engine::{Engine, SendStatus};
 use beamsocket_core::ids::ConnectionId;
 use beamsocket_core::metrics::Metrics;
+use beamsocket_core::rooms::MembershipChange;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -208,6 +210,98 @@ impl BeamEngine {
         Ok(self.engine()?.connection_count() as f64)
     }
 
+    // ── Phase 1B: rooms + broadcast. Fan-out happens in Rust — each of
+    // these is ONE FFI call regardless of recipient count (Rule 1). ──
+
+    /// Join a room. Returns 0 Changed / 1 NoOp (already joined) / 2 NotFound.
+    #[napi]
+    pub fn join(&self, id_hi: u32, id_lo: u32, room: String) -> Result<u32> {
+        Ok(membership_code(
+            self.engine()?.join(conn_id(id_hi, id_lo), &room),
+        ))
+    }
+
+    /// Leave a room. Same result codes as `join`.
+    #[napi]
+    pub fn leave(&self, id_hi: u32, id_lo: u32, room: String) -> Result<u32> {
+        Ok(membership_code(
+            self.engine()?.leave(conn_id(id_hi, id_lo), &room),
+        ))
+    }
+
+    /// Room broadcast. `except`: flat [hi0, lo0, hi1, lo1, …] id pairs.
+    /// One payload copy at this boundary (Buffer→Bytes, the single
+    /// unavoidable outbound copy), then refcount clones per recipient.
+    #[napi]
+    pub fn broadcast_room(
+        &self,
+        room: String,
+        data: Buffer,
+        is_binary: bool,
+        except: Uint32Array,
+    ) -> Result<JsFanout> {
+        let engine = self.engine()?;
+        let report = engine.broadcast_room(
+            &room,
+            bytes::Bytes::from(data.to_vec()),
+            is_binary,
+            &except_ids(&except),
+        );
+        Ok(report.into())
+    }
+
+    /// Text fast path for room broadcast.
+    #[napi]
+    pub fn broadcast_text_room(
+        &self,
+        room: String,
+        data: String,
+        except: Uint32Array,
+    ) -> Result<JsFanout> {
+        let engine = self.engine()?;
+        let report = engine.broadcast_room(
+            &room,
+            bytes::Bytes::from(data.into_bytes()),
+            false,
+            &except_ids(&except),
+        );
+        Ok(report.into())
+    }
+
+    /// Broadcast to every live connection.
+    #[napi]
+    pub fn broadcast_all(
+        &self,
+        data: Buffer,
+        is_binary: bool,
+        except: Uint32Array,
+    ) -> Result<JsFanout> {
+        let engine = self.engine()?;
+        let report = engine.broadcast_all(
+            bytes::Bytes::from(data.to_vec()),
+            is_binary,
+            &except_ids(&except),
+        );
+        Ok(report.into())
+    }
+
+    /// Text fast path for global broadcast.
+    #[napi]
+    pub fn broadcast_text_all(&self, data: String, except: Uint32Array) -> Result<JsFanout> {
+        let engine = self.engine()?;
+        let report = engine.broadcast_all(
+            bytes::Bytes::from(data.into_bytes()),
+            false,
+            &except_ids(&except),
+        );
+        Ok(report.into())
+    }
+
+    #[napi]
+    pub fn room_count(&self) -> Result<f64> {
+        Ok(self.engine()?.room_count() as f64)
+    }
+
     #[napi]
     pub fn stats(&self) -> JsStats {
         let m = &self.metrics;
@@ -249,5 +343,40 @@ fn status_code(s: SendStatus) -> u32 {
         SendStatus::Queued => 0,
         SendStatus::Backpressure => 1,
         SendStatus::NotFound => 2,
+    }
+}
+
+fn membership_code(c: MembershipChange) -> u32 {
+    match c {
+        MembershipChange::Changed => 0,
+        MembershipChange::NoOp => 1,
+        MembershipChange::NotFound => 2,
+    }
+}
+
+/// Decode the flat [hi, lo, hi, lo, …] except list (a trailing odd half is a
+/// caller bug and is ignored).
+fn except_ids(pairs: &Uint32Array) -> Vec<ConnectionId> {
+    pairs.chunks_exact(2).map(|p| conn_id(p[0], p[1])).collect()
+}
+
+/// Fan-out accounting (mirrors beamsocket_core::broadcast::FanoutReport).
+/// Informational — Phase 1 delivery semantics are frame delivery.
+#[napi(object)]
+pub struct JsFanout {
+    pub attempted: f64,
+    pub queued: f64,
+    pub backpressured: f64,
+    pub missing: f64,
+}
+
+impl From<FanoutReport> for JsFanout {
+    fn from(r: FanoutReport) -> Self {
+        JsFanout {
+            attempted: r.attempted as f64,
+            queued: r.queued as f64,
+            backpressured: r.backpressured as f64,
+            missing: r.missing as f64,
+        }
     }
 }

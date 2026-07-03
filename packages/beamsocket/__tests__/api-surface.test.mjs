@@ -1,5 +1,6 @@
-// Smoke test: the public surface exists and unimplemented methods fail
-// loudly with a phase pointer (not silently). Runs against dist/ — build first.
+// Smoke test: the public surface exists, unimplemented methods fail loudly
+// with a phase pointer, and implemented-but-unusable states fail loudly too.
+// Runs against dist/ — build first.
 import { test } from 'node:test';
 import assert from 'node:assert';
 
@@ -9,5 +10,10 @@ test('API surface', async () => {
   for (const m of ['authorize', 'on', 'toSocket', 'toUser', 'toRoom', 'broadcast', 'metrics']) {
     assert.equal(typeof io[m], 'function', `io.${m} missing`);
   }
-  assert.throws(() => io.broadcast('x'), /Phase 1B/);
+  // Phase 1B is implemented: broadcasting before listen() fails loudly…
+  assert.throws(() => io.broadcast('x'), /listen\(\)/);
+  assert.throws(() => io.toRoom('lobby'), /listen\(\)/);
+  // …while future phases still point at their phase.
+  assert.throws(() => io.toUser('u1'), /Phase 1C/);
+  assert.throws(() => io.metrics(), /Phase 1D/);
 });

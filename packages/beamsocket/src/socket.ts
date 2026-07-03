@@ -6,6 +6,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { encodeSocketId } from './ids.js';
 import type { NativeEngine } from './native.js';
 
 export interface SocketEvents {
@@ -30,7 +31,7 @@ export class Socket extends EventEmitter {
     this.#native = native;
     this._idHi = idHi;
     this._idLo = idLo;
-    this.id = `${idHi.toString(36)}-${idLo.toString(36)}`;
+    this.id = encodeSocketId(idHi, idLo);
     this.metadata = {};
   }
 
@@ -54,12 +55,18 @@ export class Socket extends EventEmitter {
     }
   }
 
-  join(_room: string): void {
-    throw new Error('Not implemented until Phase 1B — docs/ENGINEERING.md §6');
+  /** Join a room (auto-created on first join). One sync FFI call. */
+  join(room: string): void {
+    if (!this.#closed) {
+      this.#native.join(this._idHi, this._idLo, room);
+    }
   }
 
-  leave(_room: string): void {
-    throw new Error('Not implemented until Phase 1B — docs/ENGINEERING.md §6');
+  /** Leave a room (auto-destroyed on last leave). One sync FFI call. */
+  leave(room: string): void {
+    if (!this.#closed) {
+      this.#native.leave(this._idHi, this._idLo, room);
+    }
   }
 
   /** Initiate the close handshake (handled entirely in Rust — Rule 1). */

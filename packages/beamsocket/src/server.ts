@@ -8,6 +8,7 @@ import type {
   Metrics,
 } from './types.js';
 import { demux } from './events.js';
+import { decodeSocketId } from './ids.js';
 import { loadNative, type NativeConfig, type NativeEngine } from './native.js';
 import { Presence } from './presence.js';
 import { Target } from './rooms.js';
@@ -55,8 +56,14 @@ export class BeamSocket extends EventEmitter {
     return super.on(event, handler as (...args: unknown[]) => void);
   }
 
-  toSocket(_socketId: string): Target {
-    throw new Error('Not implemented until Phase 1B — docs/ENGINEERING.md §6');
+  /** Single-socket target. Unknown/stale ids no-op at send time. */
+  toSocket(socketId: string): Target {
+    const parsed = decodeSocketId(socketId);
+    return new Target(this.#requireEngine('toSocket'), {
+      type: 'socket',
+      hi: parsed?.hi ?? 0xffffffff, // guaranteed miss for foreign ids
+      lo: parsed?.lo ?? 0xffffffff,
+    });
   }
 
   /** All devices of a user. (Phase 1C) */
@@ -64,12 +71,14 @@ export class BeamSocket extends EventEmitter {
     throw new Error('Not implemented until Phase 1C — docs/ENGINEERING.md §7');
   }
 
-  toRoom(_room: string): Target {
-    throw new Error('Not implemented until Phase 1B — docs/ENGINEERING.md §6');
+  /** Room target; fan-out (with .except()) runs entirely in Rust. */
+  toRoom(room: string): Target {
+    return new Target(this.#requireEngine('toRoom'), { type: 'room', room });
   }
 
-  broadcast(_data: Buffer | string): void {
-    throw new Error('Not implemented until Phase 1B — docs/ENGINEERING.md §6');
+  /** Every live connection. One FFI call regardless of connection count. */
+  broadcast(data: Buffer | string): void {
+    new Target(this.#requireEngine('broadcast'), { type: 'all' }).send(data);
   }
 
   presence(room: string): Presence {
@@ -105,6 +114,13 @@ export class BeamSocket extends EventEmitter {
   async close(_opts: CloseOptions = {}): Promise<void> {
     this.#engine?.shutdown();
     this.#engine = undefined;
+  }
+
+  #requireEngine(method: string): NativeEngine {
+    if (!this.#engine) {
+      throw new Error(`io.${method}() requires a running server — call listen() first`);
+    }
+    return this.#engine;
   }
 
   /** One flat Buffer per bridge flush (design C): decode + dispatch. */

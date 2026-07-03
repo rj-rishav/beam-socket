@@ -35,6 +35,19 @@ export const SEND_QUEUED = 0;
 export const SEND_BACKPRESSURE = 1;
 export const SEND_NOT_FOUND = 2;
 
+/** Membership result codes (crates/node/src/binding.rs). */
+export const MEMBERSHIP_CHANGED = 0;
+export const MEMBERSHIP_NOOP = 1;
+export const MEMBERSHIP_NOT_FOUND = 2;
+
+/** Fan-out accounting — informational, frame-delivery semantics. */
+export interface NativeFanout {
+  attempted: number;
+  queued: number;
+  backpressured: number;
+  missing: number;
+}
+
 export interface NativeEngine {
   listen(port: number): number;
   send(idHi: number, idLo: number, data: Buffer, isBinary: boolean): number;
@@ -43,6 +56,15 @@ export interface NativeEngine {
   connectionCount(): number;
   stats(): NativeStats;
   shutdown(): void;
+  // Phase 1B — each call is ONE FFI hop; fan-out runs in Rust.
+  join(idHi: number, idLo: number, room: string): number;
+  leave(idHi: number, idLo: number, room: string): number;
+  /** `except`: flat [hi, lo, hi, lo, …] id pairs. */
+  broadcastRoom(room: string, data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
+  broadcastTextRoom(room: string, data: string, except: Uint32Array): NativeFanout;
+  broadcastAll(data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
+  broadcastTextAll(data: string, except: Uint32Array): NativeFanout;
+  roomCount(): number;
 }
 
 export interface NativeModule {
