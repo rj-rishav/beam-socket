@@ -84,6 +84,7 @@ fn spawn_mock_conn(id: u64, ctx: Arc<ConnCtx>) -> MockConn {
         control_rx,
         close_rx,
         ctx,
+        None, // no authorize hook in the mock-transport tests
     ));
     MockConn {
         feed: feed_tx,
@@ -126,12 +127,12 @@ async fn panicking_connection_task_is_contained() {
     // Both connections are up.
     recv_until(
         &mut rx,
-        |e| matches!(e, EngineEvent::ConnectionOpened { id } if *id == ConnectionId(1)),
+        |e| matches!(e, EngineEvent::ConnectionOpened { id, .. } if *id == ConnectionId(1)),
     )
     .await;
     recv_until(
         &mut rx,
-        |e| matches!(e, EngineEvent::ConnectionOpened { id } if *id == ConnectionId(2)),
+        |e| matches!(e, EngineEvent::ConnectionOpened { id, .. } if *id == ConnectionId(2)),
     )
     .await;
 
@@ -269,7 +270,7 @@ fn echo_bridge(
 
 #[test]
 fn engine_echoes_and_closes_cleanly_both_directions() {
-    let (engine, rx) = Engine::start(Config::default(), 1024).unwrap();
+    let (engine, rx) = Engine::start(Config::default(), 1024, false).unwrap();
     let engine = Arc::new(engine);
     let port = engine.listen(0).unwrap();
     let bridge = echo_bridge(rx, engine.clone(), 2);

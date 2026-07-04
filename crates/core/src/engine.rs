@@ -4,6 +4,7 @@
 //!
 //! Build spec: docs/ENGINEERING.md §5.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,10 +20,12 @@ use crate::connection::{
     CONTROL_QUEUE_CAPACITY,
 };
 use crate::events::{EngineEvent, EventSender};
-use crate::ids::{ConnectionId, RoomId};
+use crate::identity::{AuthorizeOutcome, AuthorizeResolution, Authorizer, IdentityRegistry};
+use crate::ids::{ConnectionId, RoomId, UserId};
+use crate::limits::{ClientIpResolver, Gate, IpLimiter};
 use crate::metrics::Metrics;
 use crate::rooms::{MembershipChange, RoomRegistry};
-use crate::transport::{Transport, WebSocketTransport};
+use crate::transport::{Accepted, FrameSink, OutFrame, Transport, WebSocketTransport};
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -65,9 +68,15 @@ pub struct Engine {
     runtime: Option<tokio::runtime::Runtime>,
     registry: Arc<Registry>,
     rooms: Arc<RoomRegistry>,
+    identity: Arc<IdentityRegistry>,
     metrics: Arc<Metrics>,
     events: EventSender,
     config: Arc<Config>,
+    /// Client-IP resolution + per-IP admission, run inside the handshake.
+    gate: Arc<Gate>,
+    /// Present only when the SDK registered an `authorize` hook. `None` = accept
+    /// all, no round-trip to JS, userId unbound (1A/1B behavior).
+    authorizer: Option<Arc<Authorizer>>,
     shutdown_tx: watch::Sender<bool>,
     listening: Mutex<bool>,
 }
@@ -80,6 +89,10 @@ impl Engine {
     pub fn start(
         config: Config,
         event_queue_capacity: usize,
+        // Phase 1C: whether the SDK registered an `authorize` hook. When false,
+        // no authorizer is built and connections are accepted without a JS
+        // round-trip (userId unbound) — the 1A/1B behavior.
+        has_authorize: bool,
     ) -> Result<(Self, mpsc::Receiver<EngineEvent>), EngineError> {
         config.validate()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -90,14 +103,32 @@ impl Engine {
         let metrics = Arc::new(Metrics::default());
         let (events, rx) = EventSender::bounded(event_queue_capacity, metrics.clone());
         let (shutdown_tx, _) = watch::channel(false);
+
+        // Build the admission gate (config validated above, so the resolver
+        // parses cleanly) and, if an authorize hook exists, the authorizer.
+        let resolver = ClientIpResolver::from_trust_proxy(&config.trust_proxy)?;
+        let limiter = Arc::new(IpLimiter::new(config.limits.max_connections_per_ip));
+        let gate = Arc::new(Gate::new(resolver, limiter, metrics.clone()));
+        let authorizer = has_authorize.then(|| {
+            Arc::new(Authorizer::new(
+                events.clone(),
+                config.authorize.max_pending,
+                config.authorize.timeout,
+                metrics.clone(),
+            ))
+        });
+
         Ok((
             Self {
                 runtime: Some(runtime),
                 registry: Arc::new(Registry::new()),
                 rooms: Arc::new(RoomRegistry::new()),
+                identity: Arc::new(IdentityRegistry::new()),
                 metrics,
                 events,
                 config: Arc::new(config),
+                gate,
+                authorizer,
                 shutdown_tx,
                 listening: Mutex::new(false),
             },
@@ -155,14 +186,15 @@ impl Engine {
             metrics: self.metrics.clone(),
             events: self.events.clone(),
         });
-        let registry = self.registry.clone();
-        let rooms = self.rooms.clone();
         let shutdown_rx = self.shutdown_tx.subscribe();
         handle.spawn(accept_loop::<WebSocketTransport>(
             listener,
             ctx,
-            registry,
-            rooms,
+            self.registry.clone(),
+            self.rooms.clone(),
+            self.identity.clone(),
+            self.gate.clone(),
+            self.authorizer.clone(),
             shutdown_rx,
         ));
         *listening = true;
@@ -172,8 +204,14 @@ impl Engine {
     // ── Phase 1B: rooms + broadcast (fan-out entirely in Rust, Rule 1) ──
 
     /// Join a room (auto-created on first join). Sync JS→Rust call.
+    /// `maxRoomsPerConnection` is enforced in `rooms.rs` (Phase 1C).
     pub fn join(&self, id: ConnectionId, room: &str) -> MembershipChange {
-        self.rooms.join(&self.registry, id, RoomId(room.to_owned()))
+        self.rooms.join(
+            &self.registry,
+            id,
+            RoomId(room.to_owned()),
+            self.config.limits.max_rooms_per_connection,
+        )
     }
 
     /// Leave a room (auto-destroyed on last leave). Sync JS→Rust call.
@@ -194,6 +232,7 @@ impl Engine {
         broadcast(
             &self.registry,
             &self.rooms,
+            &self.identity,
             FanoutTarget::Room(&RoomId(room.to_owned())),
             data,
             is_binary,
@@ -211,11 +250,59 @@ impl Engine {
         broadcast(
             &self.registry,
             &self.rooms,
+            &self.identity,
             FanoutTarget::All,
             data,
             is_binary,
             except,
         )
+    }
+
+    // ── Phase 1C: identity ──
+
+    /// Fan a payload out to every device of one user (`io.toUser().send()`),
+    /// entirely in Rust over the sharded identity index — one FFI call, one
+    /// allocation regardless of device count (reuses the 1B broadcast path).
+    pub fn broadcast_user(
+        &self,
+        user_id: &str,
+        data: bytes::Bytes,
+        is_binary: bool,
+        except: &[ConnectionId],
+    ) -> FanoutReport {
+        broadcast(
+            &self.registry,
+            &self.rooms,
+            &self.identity,
+            FanoutTarget::User(&UserId(user_id.to_owned())),
+            data,
+            is_binary,
+            except,
+        )
+    }
+
+    /// JS replied to an `authorize` request (the `resolveAuthorize` command).
+    /// No-op if there is no authorizer or the id is unknown/stale.
+    pub fn resolve_authorize(&self, request_id: u64, outcome: AuthorizeOutcome) {
+        if let Some(auth) = &self.authorizer {
+            auth.resolve(request_id, outcome);
+        }
+    }
+
+    /// Distinct users with ≥1 live connection.
+    pub fn user_count(&self) -> u64 {
+        self.identity.user_count() as u64
+    }
+
+    /// Live device count for a user (diagnostics/tests).
+    pub fn user_device_count(&self, user_id: &str) -> usize {
+        self.identity.device_count(&UserId(user_id.to_owned()))
+    }
+
+    /// Distinct client IPs currently tracked by `maxConnectionsPerIp`
+    /// (leak-test diagnostic; 0 when the limit is unlimited).
+    pub fn tracked_ips(&self) -> usize {
+        self.gate.tracked_ips()
     }
 
     pub fn room_count(&self) -> usize {
@@ -277,11 +364,15 @@ impl Engine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop<T: Transport>(
     listener: TcpListener,
     ctx: Arc<ConnCtx>,
     registry: Arc<Registry>,
     rooms: Arc<RoomRegistry>,
+    identity: Arc<IdentityRegistry>,
+    gate: Arc<Gate>,
+    authorizer: Option<Arc<Authorizer>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -292,15 +383,19 @@ async fn accept_loop<T: Transport>(
                 }
             }
             accepted = listener.accept() => match accepted {
-                Ok((tcp, _peer)) => {
+                Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
                     // One isolated task per connection (tokio contains its
                     // panics; run_connection contains them WITH cleanup).
                     tokio::spawn(setup_connection::<T>(
                         tcp,
+                        peer.ip(),
                         ctx.clone(),
                         registry.clone(),
                         rooms.clone(),
+                        identity.clone(),
+                        gate.clone(),
+                        authorizer.clone(),
                     ));
                 }
                 Err(_) => {
@@ -312,16 +407,56 @@ async fn accept_loop<T: Transport>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn setup_connection<T: Transport>(
     tcp: TcpStream,
+    peer: IpAddr,
     ctx: Arc<ConnCtx>,
     registry: Arc<Registry>,
     rooms: Arc<RoomRegistry>,
+    identity: Arc<IdentityRegistry>,
+    gate: Arc<Gate>,
+    authorizer: Option<Arc<Authorizer>>,
 ) {
-    // Handshake failures never reach JS — the socket just goes away.
-    let Ok((sink, source)) = T::accept(tcp, &ctx.config).await else {
+    // The gate runs INSIDE the handshake: maxConnectionsPerIp is a plain HTTP
+    // 429 before any WebSocket exists. A rejected/failed handshake never
+    // reaches JS — the socket just goes away (the per-IP slot, if reserved, is
+    // released inside `accept`).
+    let Ok(Accepted {
+        sink,
+        source,
+        upgrade,
+    }) = T::accept(tcp, peer, &ctx.config, &gate).await
+    else {
         return;
     };
+    // Hold the per-IP admission slot for the whole connection lifetime: dropping
+    // this guard (on ANY return below) releases it, so a churn of
+    // connect/disconnect leaves the per-IP table empty (leak test).
+    let _ip_guard = upgrade.guard;
+
+    // Authorize — the one connection-time JS round-trip (Rule 1: once per
+    // connection, never per message). No hook registered → accept all, userId
+    // unbound (1A/1B behavior), no round-trip.
+    let (user_id, auth_request) = match &authorizer {
+        Some(auth) => match auth
+            .authorize(upgrade.client_ip, upgrade.url, upgrade.headers)
+            .await
+        {
+            AuthorizeResolution::Accept {
+                user_id,
+                request_id,
+            } => (user_id, Some(request_id)),
+            AuthorizeResolution::Reject { code, reason } => {
+                // Already upgraded; close the socket with the app's (or the
+                // engine's transient) code. No registry insert, no Opened event.
+                reject_after_upgrade(sink, code, reason).await;
+                return; // _ip_guard drops → per-IP slot released
+            }
+        },
+        None => (None, None),
+    };
+
     let mailbox = Mailbox::new(
         ctx.config.backpressure.high_water_mark,
         ctx.config.backpressure.policy,
@@ -336,13 +471,44 @@ async fn setup_connection<T: Transport>(
     };
     let id = registry.insert(handle.clone());
     Metrics::add(&ctx.metrics.connections, 1);
+    // Bind identity BEFORE Opened fires so `toUser` can reach a brand-new
+    // device immediately. Unbound below on disconnect.
+    if let Some(uid) = &user_id {
+        identity.bind(uid.clone(), id);
+    }
 
-    run_connection(id, source, sink, handle, control_rx, close_rx, ctx.clone()).await;
+    run_connection(
+        id,
+        source,
+        sink,
+        handle,
+        control_rx,
+        close_rx,
+        ctx.clone(),
+        auth_request,
+    )
+    .await;
 
     // Bidirectional membership cleanup: the entry (and its room set) comes
     // out first, so no join can race the sweep — O(rooms) per §6.
     if let Some((_, joined)) = registry.remove_full(id) {
         rooms.disconnect_cleanup(id, joined);
     }
+    // Unbind identity (auto-destroys the user entry on its last device).
+    if let Some(uid) = &user_id {
+        identity.unbind(uid, id);
+    }
     Metrics::sub(&ctx.metrics.connections, 1);
+}
+
+/// Send a close frame with the authorize-reject code to an already-upgraded
+/// socket, then tear it down. Best-effort — the client is going away regardless.
+async fn reject_after_upgrade<Snk: FrameSink>(mut sink: Snk, code: u16, reason: &str) {
+    let _ = sink
+        .send_frame(OutFrame::Close {
+            code,
+            reason: reason.to_owned(),
+        })
+        .await;
+    sink.shutdown().await;
 }

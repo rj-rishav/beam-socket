@@ -25,14 +25,25 @@ export class Socket extends EventEmitter {
   #native: NativeEngine;
   #closed = false;
 
-  /** @internal Constructed by the server's demux on ConnectionOpened. */
-  constructor(native: NativeEngine, idHi: number, idLo: number) {
+  /**
+   * @internal Constructed by the server's demux on ConnectionOpened. `userId`
+   * and `metadata` come from the `authorize` hook that admitted this connection
+   * (Phase 1C); both are absent for a connection admitted with no hook.
+   */
+  constructor(
+    native: NativeEngine,
+    idHi: number,
+    idLo: number,
+    userId?: string,
+    metadata?: Record<string, unknown>,
+  ) {
     super();
     this.#native = native;
     this._idHi = idHi;
     this._idLo = idLo;
     this.id = encodeSocketId(idHi, idLo);
-    this.metadata = {};
+    this.userId = userId;
+    this.metadata = metadata ?? {};
   }
 
   get closed(): boolean {

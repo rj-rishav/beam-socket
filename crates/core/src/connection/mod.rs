@@ -43,6 +43,15 @@ pub const CLOSE_ABNORMAL: u16 = 1006;
 pub const CLOSE_INTERNAL_ERROR: u16 = 1011;
 /// Backpressure policy `Disconnect` fired ("try again later").
 pub const CLOSE_BACKPRESSURE: u16 = 1013;
+/// `authorize` returned `{ accept: false }` with no explicit code — the default
+/// policy rejection (RFC 1008 "policy violation"). Apps may override with any
+/// code, including the 4000–4999 application range (ARCHITECTURE §4 example
+/// uses 4401/4403). (Phase 1C)
+pub const CLOSE_UNAUTHORIZED: u16 = 1008;
+/// `authorize` could not complete — it timed out, or the bounded pending-upgrade
+/// table was full. RFC 1013 "try again later": the client should retry. Distinct
+/// from an app-driven rejection, which is a decision, not a transient. (Phase 1C)
+pub const CLOSE_AUTH_UNAVAILABLE: u16 = 1013;
 
 /// How long a graceful close may wait for the peer's close frame before the
 /// connection is torn down anyway.
@@ -135,6 +144,7 @@ pub struct ConnCtx {
 /// see `Engine`'s `setup_connection`.
 ///
 /// Returns the (code, reason) reported in the Closed event.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection<Src, Snk>(
     id: ConnectionId,
     source: Src,
@@ -143,13 +153,17 @@ pub async fn run_connection<Src, Snk>(
     control_rx: mpsc::Receiver<Control>,
     close_rx: watch::Receiver<Option<CloseCmd>>,
     ctx: Arc<ConnCtx>,
+    // Phase 1C: the originating authorize `request_id` for a connection admitted
+    // by an `authorize` hook, so the SDK can attach the userId/metadata it
+    // produced. `None` when no hook ran (accept-all).
+    auth_request: Option<u64>,
 ) -> (u16, String)
 where
     Src: FrameSource,
     Snk: FrameSink,
 {
     ctx.events
-        .control(EngineEvent::ConnectionOpened { id })
+        .control(EngineEvent::ConnectionOpened { id, auth_request })
         .await;
 
     // Writer: separate task so a slow socket never blocks reads. Its panic is

@@ -14,11 +14,13 @@
 //! allocation (ENGINEERING.md §6).
 
 use std::future::Future;
+use std::net::IpAddr;
 
 use bytes::Bytes;
 use tokio::net::TcpStream;
 
 use crate::config::Config;
+use crate::limits::{AdmittedUpgrade, Gate};
 
 /// A frame arriving from the peer, already decoded by the transport.
 /// Ping is intentionally absent: replying to pings is codec bookkeeping and
@@ -90,17 +92,47 @@ pub trait FrameSink: Send + Unpin + 'static {
     fn shutdown(&mut self) -> impl Future<Output = ()> + Send;
 }
 
-/// Implemented by transport/websocket.rs in Phase 1A.
+/// A completed, admitted upgrade: the split frame halves plus the resolved
+/// client IP, captured request metadata (for `authorize`), and the RAII per-IP
+/// admission slot (Phase 1C).
+pub struct Accepted<Snk, Src> {
+    pub sink: Snk,
+    pub source: Src,
+    pub upgrade: AdmittedUpgrade,
+}
+
+/// Why an accept did not yield a live connection. Either variant means "return,
+/// don't proceed" for the caller; any per-IP slot reserved by the gate is
+/// released internally before this is returned, so the caller has no cleanup.
+#[derive(Debug)]
+pub enum AcceptError {
+    /// The gate rejected the upgrade before it completed (e.g. the per-IP cap —
+    /// an HTTP 429 was sent), or the request was malformed before the gate ran.
+    /// Nothing was admitted; no JS ever runs for this attempt.
+    Rejected,
+    /// The protocol handshake failed AFTER admission (rare). The admission slot
+    /// has already been released.
+    Handshake(TransportError),
+}
+
+/// Implemented by transport/websocket.rs in Phase 1A (Phase 1C: gated accept).
 pub trait Transport: Send + Sync + 'static {
     type Source: FrameSource;
     type Sink: FrameSink;
 
-    /// Perform the protocol handshake on an accepted TCP stream and return
-    /// split frame halves.
+    /// Perform the protocol handshake on an accepted TCP stream. The `gate`
+    /// runs INSIDE the handshake (Phase 1C): it resolves the client IP from
+    /// `peer` + `X-Forwarded-For` per `trustProxy` and enforces
+    /// `maxConnectionsPerIp` BEFORE the upgrade completes — a rejected
+    /// connection never becomes a WebSocket. On success the split frame halves
+    /// come back alongside the resolved IP, captured headers, and the per-IP
+    /// admission guard (see [`Accepted`]).
     fn accept(
         io: TcpStream,
+        peer: IpAddr,
         config: &Config,
-    ) -> impl Future<Output = Result<(Self::Sink, Self::Source), TransportError>> + Send;
+        gate: &Gate,
+    ) -> impl Future<Output = Result<Accepted<Self::Sink, Self::Source>, AcceptError>> + Send;
 }
 
 pub mod websocket;
