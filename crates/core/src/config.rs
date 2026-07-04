@@ -75,12 +75,37 @@ pub enum TrustProxy {
     Cidrs(Vec<String>), // parsed + validated in limits.rs (Phase 1C)
 }
 
+/// The `authorize` hook (Phase 1C): a JS round-trip run once per connection at
+/// upgrade time. These knobs are Rust-side safety rails, NOT the hook itself —
+/// the hook lives in JS. Both are Rule 5 concerns: the pending-upgrade table is
+/// a bounded queue, and an authorize promise that never settles must not leak.
+#[derive(Debug, Clone)]
+pub struct Authorize {
+    /// How long to wait for the JS `authorize` promise to settle before the
+    /// connection is rejected-and-cleaned (never left hanging). Default ~10 s.
+    pub timeout: Duration,
+    /// Upper bound on concurrently-pending authorizations (Rule 5). Overflow →
+    /// reject at the door; unauthenticated handshakes are a DoS surface, so the
+    /// pending table cannot grow without bound. 0 is rejected by `validate`.
+    pub max_pending: usize,
+}
+
+impl Default for Authorize {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            max_pending: 8192,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub limits: Limits,
     pub backpressure: Backpressure,
     pub keepalive: Keepalive,
     pub trust_proxy: TrustProxy,
+    pub authorize: Authorize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +135,18 @@ impl Config {
         if self.keepalive.pong_timeout < Duration::from_millis(1) {
             return Err(ConfigError("keepalive.pongTimeoutMs must be >= 1".into()));
         }
+        if self.authorize.timeout < Duration::from_millis(1) {
+            return Err(ConfigError("authorize.timeoutMs must be >= 1".into()));
+        }
+        if self.authorize.max_pending == 0 {
+            return Err(ConfigError(
+                "authorize.maxPending must be > 0 (the pending-upgrade table is bounded)".into(),
+            ));
+        }
+        // Fail loudly at startup on a malformed trustProxy CIDR rather than
+        // silently treat every peer as untrusted at runtime (a security
+        // boundary must not degrade quietly — ARCHITECTURE §4).
+        crate::limits::ClientIpResolver::from_trust_proxy(&self.trust_proxy)?;
         Ok(())
     }
 }
@@ -139,6 +176,37 @@ mod tests {
 
         let mut c = Config::default();
         c.keepalive.pong_timeout = Duration::ZERO;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.authorize.timeout = Duration::ZERO;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.authorize.max_pending = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn valid_trust_proxy_cidrs_accepted() {
+        let mut c = Config::default();
+        c.trust_proxy = TrustProxy::Cidrs(vec![
+            "10.0.0.0/8".into(),
+            "172.16.0.0/12".into(),
+            "::1/128".into(),
+            "fd00::/8".into(),
+        ]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn malformed_trust_proxy_cidr_rejected() {
+        let mut c = Config::default();
+        c.trust_proxy = TrustProxy::Cidrs(vec!["not-a-cidr".into()]);
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.trust_proxy = TrustProxy::Cidrs(vec!["10.0.0.0/33".into()]); // impossible prefix
         assert!(c.validate().is_err());
     }
 }

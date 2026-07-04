@@ -9,6 +9,7 @@ import type { NativeEngine } from './native.js';
 export type TargetKind =
   | { type: 'socket'; hi: number; lo: number }
   | { type: 'room'; room: string }
+  | { type: 'user'; userId: string }
   | { type: 'all' };
 
 export class Target {
@@ -55,6 +56,15 @@ export class Target {
           this.#native.broadcastTextRoom(k.room, data, except);
         } else {
           this.#native.broadcastRoom(k.room, data, true, except);
+        }
+        return;
+      }
+      case 'user': {
+        const except = Uint32Array.from(this.#excluded);
+        if (typeof data === 'string') {
+          this.#native.broadcastTextUser(k.userId, data, except);
+        } else {
+          this.#native.broadcastUser(k.userId, data, true, except);
         }
         return;
       }

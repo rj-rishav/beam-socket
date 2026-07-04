@@ -15,6 +15,9 @@ bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 # Phase 1B (rooms — sharded registry):
 dashmap = "6"
+# Phase 1C (trustProxy CIDR parsing + membership, IPv4+IPv6). Small and
+# dependency-light — ARCHITECTURE §4 allows "an ipnet-class crate".
+ipnet = "2"
 
 [dev-dependencies]
 proptest = "1" # Phase 1B membership property tests

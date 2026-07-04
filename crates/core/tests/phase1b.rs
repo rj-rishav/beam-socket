@@ -16,6 +16,7 @@ use beamsocket_core::connection::registry::Registry;
 use beamsocket_core::connection::{CloseSignal, ConnHandle, Control, CONTROL_QUEUE_CAPACITY};
 use beamsocket_core::engine::Engine;
 use beamsocket_core::events::EngineEvent;
+use beamsocket_core::identity::IdentityRegistry;
 use beamsocket_core::ids::{ConnectionId, RoomId};
 use beamsocket_core::metrics::Metrics;
 use beamsocket_core::rooms::{MembershipChange, RoomRegistry};
@@ -74,10 +75,10 @@ proptest! {
             match *op {
                 Op::Join(c, r) => {
                     if let Some(id) = ids[c as usize] {
-                        rooms.join(&conns, id, room(r));
+                        rooms.join(&conns, id, room(r), 0);
                     } else if let Some(dead) = dead_id(&ids, c) {
                         // Stale id after disconnect must be a NotFound no-op.
-                        prop_assert_eq!(rooms.join(&conns, dead, room(r)), MembershipChange::NotFound);
+                        prop_assert_eq!(rooms.join(&conns, dead, room(r), 0), MembershipChange::NotFound);
                     }
                 }
                 Op::Leave(c, r) => {
@@ -150,14 +151,19 @@ async fn fanout_exactly_once_except_honored_nonmembers_nothing() {
     let c = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest));
     let outsider = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest));
 
+    let identity = IdentityRegistry::new();
     for id in [a, b, c] {
-        assert_eq!(rooms.join(&conns, id, room(1)), MembershipChange::Changed);
+        assert_eq!(
+            rooms.join(&conns, id, room(1), 0),
+            MembershipChange::Changed
+        );
     }
 
     let payload = Bytes::from(vec![7u8; 512]);
     let report = broadcast(
         &conns,
         &rooms,
+        &identity,
         FanoutTarget::Room(&room(1)),
         payload.clone(),
         true,
@@ -199,8 +205,9 @@ async fn slow_member_hits_policy_alone() {
     let slow = conns.insert(mk_handle(&metrics, 64, BackpressurePolicy::Disconnect));
     let healthy2 = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::Disconnect));
 
+    let identity = IdentityRegistry::new();
     for id in [healthy1, slow, healthy2] {
-        rooms.join(&conns, id, room(2));
+        rooms.join(&conns, id, room(2), 0);
     }
     // Saturate the slow member's mailbox (64-byte HWM).
     let slow_handle = conns.get(slow).unwrap();
@@ -216,6 +223,7 @@ async fn slow_member_hits_policy_alone() {
     let report = broadcast(
         &conns,
         &rooms,
+        &identity,
         FanoutTarget::Room(&room(2)),
         payload,
         true,
@@ -245,7 +253,7 @@ async fn slow_member_hits_policy_alone() {
 
 #[test]
 fn rooms_broadcast_end_to_end() {
-    let (engine, mut rx) = Engine::start(Config::default(), 1024).unwrap();
+    let (engine, mut rx) = Engine::start(Config::default(), 1024, false).unwrap();
     let engine = Arc::new(engine);
     let port = engine.listen(0).unwrap();
 
@@ -255,7 +263,7 @@ fn rooms_broadcast_end_to_end() {
         let mut closes = 0;
         while let Some(ev) = rx.blocking_recv() {
             match ev {
-                EngineEvent::ConnectionOpened { id } => ids_tx.send(id).unwrap(),
+                EngineEvent::ConnectionOpened { id, .. } => ids_tx.send(id).unwrap(),
                 EngineEvent::ConnectionClosed { .. } => {
                     closes += 1;
                     if closes == 3 {

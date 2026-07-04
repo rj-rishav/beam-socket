@@ -14,12 +14,17 @@ const requireNative = createRequire(import.meta.url);
 
 export interface NativeStats {
   connections: number;
+  users: number;
   messagesIn: number;
   messagesOut: number;
   bytesIn: number;
   bytesOut: number;
   backpressureDrops: number;
   bridgeDropped: number;
+  admissionRejectedIp: number;
+  authorizeRejected: number;
+  authorizeTimedOut: number;
+  pendingOverflow: number;
 }
 
 export interface NativeConfig {
@@ -28,6 +33,14 @@ export interface NativeConfig {
   backpressurePolicy?: string;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
+  // Phase 1C
+  maxConnectionsPerIp?: number;
+  maxRoomsPerConnection?: number;
+  /** "never" | "always" | "cidrs" — the SDK maps `false | true | string[]`. */
+  trustProxyMode?: string;
+  trustProxyCidrs?: string[];
+  authorizeTimeoutMs?: number;
+  maxPendingAuthorizations?: number;
 }
 
 /** Send status codes from crates/node/src/binding.rs. */
@@ -39,6 +52,8 @@ export const SEND_NOT_FOUND = 2;
 export const MEMBERSHIP_CHANGED = 0;
 export const MEMBERSHIP_NOOP = 1;
 export const MEMBERSHIP_NOT_FOUND = 2;
+/** Phase 1C: join refused by `maxRoomsPerConnection`. */
+export const MEMBERSHIP_LIMIT_EXCEEDED = 3;
 
 /** Fan-out accounting — informational, frame-delivery semantics. */
 export interface NativeFanout {
@@ -65,11 +80,25 @@ export interface NativeEngine {
   broadcastAll(data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
   broadcastTextAll(data: string, except: Uint32Array): NativeFanout;
   roomCount(): number;
+  // Phase 1C — identity + authorize.
+  /** JS's reply to an authorize request (reqHi/reqLo = request_id halves). */
+  resolveAuthorize(
+    reqHi: number,
+    reqLo: number,
+    accept: boolean,
+    userId: string,
+    hasUserId: boolean,
+    code: number,
+  ): void;
+  broadcastUser(userId: string, data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
+  broadcastTextUser(userId: string, data: string, except: Uint32Array): NativeFanout;
 }
 
 export interface NativeModule {
   BeamEngine: {
-    start(cfg: NativeConfig, onFlush: (buf: Buffer) => void): NativeEngine;
+    /** `hasAuthorize` tells Rust whether to run the authorize round-trip at
+     * all — false means accept-all, no JS round-trip (Rule 1). */
+    start(cfg: NativeConfig, hasAuthorize: boolean, onFlush: (buf: Buffer) => void): NativeEngine;
   };
 }
 

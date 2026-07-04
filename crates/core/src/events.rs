@@ -24,8 +24,31 @@ use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum EngineEvent {
+    /// The FIRST request/response round-trip across the bridge (Phase 1C): the
+    /// engine asks JS to authorize a pending upgrade. JS replies out-of-band
+    /// via the `resolveAuthorize` command (crates/node), keyed by `request_id`.
+    /// Lossless like the other control events — a dropped request would hang a
+    /// connection until its `authorize.timeout` (identity.rs) rather than fail
+    /// fast, so this rides the awaited `control` path, never `try_message`.
+    Authorize {
+        request_id: u64,
+        /// Resolved client IP (already through `trustProxy`) — the value the
+        /// app should treat as authoritative, matching `maxConnectionsPerIp`.
+        client_ip: String,
+        /// Request target (the upgrade request's URI path+query).
+        url: String,
+        /// Request headers, names lowercased (transport/websocket.rs).
+        headers: Vec<(String, String)>,
+    },
     /// A connection passed admission + authorize and is live. (Phase 1A)
-    ConnectionOpened { id: ConnectionId },
+    ///
+    /// Phase 1C: for a connection admitted by an `authorize` hook, `auth_request`
+    /// carries the originating `request_id` so the SDK can attach the `userId` /
+    /// `metadata` it produced; `None` for connections admitted with no hook.
+    ConnectionOpened {
+        id: ConnectionId,
+        auth_request: Option<u64>,
+    },
     /// App subscribed to `message` on this connection. (Phase 1A; payload is
     /// a refcounted view of the codec read buffer since 1B — no copy here.)
     Message {

@@ -13,10 +13,15 @@
 //! the RFC-correct close frames on the wire. The engine only sees the
 //! transport-neutral `InFrame`/`TransportError` view.
 
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
@@ -24,7 +29,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::config::Config;
-use crate::transport::{FrameSink, FrameSource, InFrame, OutFrame, Transport, TransportError};
+use crate::limits::{AdmittedUpgrade, Gate};
+use crate::transport::{
+    AcceptError, Accepted, FrameSink, FrameSource, InFrame, OutFrame, Transport, TransportError,
+};
 
 /// Initial codec read-buffer size. tungstenite's default (128 KiB) is tuned
 /// for throughput on few sockets; BeamSocket's density target wants small
@@ -55,22 +63,85 @@ impl Transport for WebSocketTransport {
     type Source = WsSource;
     type Sink = WsSink;
 
+    // The handshake callback's `Err` type (`ErrorResponse` = an HTTP response)
+    // is tungstenite's API, not ours — we can't box it. Allowed narrowly.
+    #[allow(clippy::result_large_err)]
     async fn accept(
         io: TcpStream,
+        peer: IpAddr,
         config: &Config,
-    ) -> Result<(Self::Sink, Self::Source), TransportError> {
-        // Admission limit enforced in Rust before any JS runs: a frame or
+        gate: &Gate,
+    ) -> Result<Accepted<Self::Sink, Self::Source>, AcceptError> {
+        // max_payload_bytes enforced in Rust before any JS runs: a frame or
         // message over the cap is rejected by the codec with close 1009.
         let ws_cfg = WebSocketConfig::default()
             .max_message_size(Some(config.limits.max_payload_bytes))
             .max_frame_size(Some(config.limits.max_payload_bytes))
             .read_buffer_size(READ_BUFFER_SIZE);
 
-        let ws = tokio_tungstenite::accept_async_with_config(io, Some(ws_cfg))
-            .await
-            .map_err(map_err)?;
-        let (sink, stream) = ws.split();
-        Ok((WsSink(sink), WsSource(stream)))
+        // The gate runs INSIDE the handshake callback (sync): resolve the
+        // client IP and enforce maxConnectionsPerIp BEFORE the upgrade
+        // completes, so a rejected connection is a plain HTTP 429 and never
+        // becomes a WebSocket. The admitted upgrade (with its per-IP guard) is
+        // handed out through this slot because the callback is `FnOnce`.
+        let slot: Arc<Mutex<Option<AdmittedUpgrade>>> = Arc::new(Mutex::new(None));
+        let slot_cb = slot.clone();
+        let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            // Capture headers (names lowercased) + target for authorize.
+            let mut headers = Vec::with_capacity(req.headers().len());
+            for (name, value) in req.headers().iter() {
+                headers.push((
+                    name.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                ));
+            }
+            let url = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_owned())
+                .unwrap_or_else(|| req.uri().to_string());
+
+            match gate.admit(peer, headers, url) {
+                Ok(upgrade) => {
+                    *slot_cb.lock().unwrap() = Some(upgrade);
+                    Ok(resp)
+                }
+                Err(status) => {
+                    // Reject the upgrade with an HTTP status — no WebSocket is
+                    // ever created (cheaper than close-after-handshake).
+                    let mut err = ErrorResponse::new(Some(
+                        "connection rejected: per-IP connection limit reached".to_owned(),
+                    ));
+                    *err.status_mut() =
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+                    Err(err)
+                }
+            }
+        };
+
+        match tokio_tungstenite::accept_hdr_async_with_config(io, callback, Some(ws_cfg)).await {
+            Ok(ws) => {
+                let upgrade = slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("gate stored the admitted upgrade on success");
+                let (sink, stream) = ws.split();
+                Ok(Accepted {
+                    sink: WsSink(sink),
+                    source: WsSource(stream),
+                    upgrade,
+                })
+            }
+            Err(e) => match slot.lock().unwrap().take() {
+                // Admit happened, then the handshake failed: dropping `upgrade`
+                // here releases the per-IP slot (its guard's Drop).
+                Some(_upgrade) => Err(AcceptError::Handshake(map_err(e))),
+                // Gate rejected (429) or the request was malformed before the
+                // gate ran — nothing was admitted.
+                None => Err(AcceptError::Rejected),
+            },
+        }
     }
 }
 

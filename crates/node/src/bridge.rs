@@ -52,15 +52,19 @@ pub const ENGINE_BRIDGE_QUEUE_CAPACITY: usize = 8192;
 /// ```
 ///
 /// `kind`: 0 = text message, 1 = binary message, 2 = connection opened
-/// (empty payload), 3 = connection closed (payload = [u16 close_code][reason
-/// utf-8]). This is the Phase 1A production form of the spike's proven
-/// encoder (`spike/bridge-core/src/lib.rs::flat`): the spike carried a
-/// latency timestamp per event and only messages; production replaces the
-/// timestamp slot with `conn_id` and folds the rare open/close control events
-/// into the same batched stream via the kind byte — same size, same layout,
-/// no second channel. The JS side creates one `Buffer` over the whole flush
-/// and exposes each `payload` as a zero-copy `subarray` — no per-message
-/// allocation (RFC 0001 §"Copy vs external buffers").
+/// (payload = the originating authorize `request_id` as 8 LE bytes, or empty
+/// for a connection admitted with no `authorize` hook), 3 = connection closed
+/// (payload = [u16 close_code][reason utf-8]), 4 = authorize request (Phase 1C —
+/// the `conn_id` slot carries the u64 `request_id`; payload is the length-
+/// prefixed client IP, URL, and header list, decoded below). This is the
+/// Phase 1A production form of the spike's proven encoder
+/// (`spike/bridge-core/src/lib.rs::flat`): the spike carried a latency
+/// timestamp per event and only messages; production replaces the timestamp
+/// slot with `conn_id` and folds the rare open/close/authorize control events
+/// into the same batched stream via the kind byte — no second channel. The JS
+/// side creates one `Buffer` over the whole flush and exposes each message
+/// `payload` as a zero-copy `subarray` — no per-message allocation (RFC 0001
+/// §"Copy vs external buffers").
 pub mod flat {
     use super::*;
 
@@ -71,12 +75,41 @@ pub mod flat {
     pub const KIND_BINARY: u8 = 1;
     pub const KIND_OPEN: u8 = 2;
     pub const KIND_CLOSE: u8 = 3;
+    /// Phase 1C: the authorize request/response round-trip's request leg.
+    pub const KIND_AUTHORIZE: u8 = 4;
+
+    /// Bytes for one u32 length-prefixed field.
+    fn lp_len(bytes: usize) -> usize {
+        4 + bytes
+    }
+
+    fn authorize_payload_len(client_ip: &str, url: &str, headers: &[(String, String)]) -> usize {
+        lp_len(client_ip.len())
+            + lp_len(url.len())
+            + 4 // header count
+            + headers
+                .iter()
+                .map(|(k, v)| lp_len(k.len()) + lp_len(v.len()))
+                .sum::<usize>()
+    }
 
     fn event_payload_len(ev: &EngineEvent) -> usize {
         match ev {
             EngineEvent::Message { payload, .. } => payload.len(),
-            EngineEvent::ConnectionOpened { .. } => 0,
+            EngineEvent::ConnectionOpened { auth_request, .. } => {
+                if auth_request.is_some() {
+                    8
+                } else {
+                    0
+                }
+            }
             EngineEvent::ConnectionClosed { reason, .. } => 2 + reason.len(),
+            EngineEvent::Authorize {
+                client_ip,
+                url,
+                headers,
+                ..
+            } => authorize_payload_len(client_ip, url, headers),
         }
     }
 
@@ -106,10 +139,16 @@ pub mod flat {
                     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                     out.extend_from_slice(payload);
                 }
-                EngineEvent::ConnectionOpened { id } => {
+                EngineEvent::ConnectionOpened { id, auth_request } => {
                     out.extend_from_slice(&id.0.to_le_bytes());
                     out.push(KIND_OPEN);
-                    out.extend_from_slice(&0u32.to_le_bytes());
+                    match auth_request {
+                        Some(request_id) => {
+                            out.extend_from_slice(&8u32.to_le_bytes());
+                            out.extend_from_slice(&request_id.to_le_bytes());
+                        }
+                        None => out.extend_from_slice(&0u32.to_le_bytes()),
+                    }
                 }
                 EngineEvent::ConnectionClosed { id, code, reason } => {
                     out.extend_from_slice(&id.0.to_le_bytes());
@@ -118,9 +157,45 @@ pub mod flat {
                     out.extend_from_slice(&code.to_le_bytes());
                     out.extend_from_slice(reason.as_bytes());
                 }
+                EngineEvent::Authorize {
+                    request_id,
+                    client_ip,
+                    url,
+                    headers,
+                } => {
+                    // The conn_id slot carries the request_id — there is no
+                    // connection yet.
+                    out.extend_from_slice(&request_id.to_le_bytes());
+                    out.push(KIND_AUTHORIZE);
+                    out.extend_from_slice(
+                        &(authorize_payload_len(client_ip, url, headers) as u32).to_le_bytes(),
+                    );
+                    write_lp(&mut out, client_ip.as_bytes());
+                    write_lp(&mut out, url.as_bytes());
+                    out.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+                    for (k, v) in headers {
+                        write_lp(&mut out, k.as_bytes());
+                        write_lp(&mut out, v.as_bytes());
+                    }
+                }
             }
         }
         out
+    }
+
+    /// Write a u32-length-prefixed byte field.
+    fn write_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    /// Read a u32-length-prefixed byte field, advancing `off`.
+    fn read_lp<'a>(buf: &'a [u8], off: &mut usize) -> &'a [u8] {
+        let len = u32::from_le_bytes(buf[*off..*off + 4].try_into().unwrap()) as usize;
+        *off += 4;
+        let bytes = &buf[*off..*off + len];
+        *off += len;
+        bytes
     }
 
     /// One decoded event (payload borrowed from the flush buffer — the JS
@@ -134,11 +209,21 @@ pub mod flat {
         },
         Opened {
             conn_id: ConnectionId,
+            /// The originating authorize `request_id`, if the connection was
+            /// admitted by an `authorize` hook (Phase 1C); `None` otherwise.
+            auth_request: Option<u64>,
         },
         Closed {
             conn_id: ConnectionId,
             code: u16,
             reason: &'a [u8],
+        },
+        Authorize {
+            request_id: u64,
+            client_ip: &'a [u8],
+            url: &'a [u8],
+            /// Header (name, value) pairs, names lowercased.
+            headers: Vec<(&'a [u8], &'a [u8])>,
         },
     }
 
@@ -166,12 +251,36 @@ pub mod flat {
                     is_binary: kind == KIND_BINARY,
                     payload,
                 },
-                KIND_OPEN => DecodedEvent::Opened { conn_id },
+                KIND_OPEN => DecodedEvent::Opened {
+                    conn_id,
+                    auth_request: (len == 8)
+                        .then(|| u64::from_le_bytes(payload[0..8].try_into().unwrap())),
+                },
                 KIND_CLOSE => DecodedEvent::Closed {
                     conn_id,
                     code: u16::from_le_bytes(payload[0..2].try_into().unwrap()),
                     reason: &payload[2..],
                 },
+                KIND_AUTHORIZE => {
+                    // conn_id slot held the request_id.
+                    let mut p = 0usize;
+                    let client_ip = read_lp(payload, &mut p);
+                    let url = read_lp(payload, &mut p);
+                    let hcount = u32::from_le_bytes(payload[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4;
+                    let mut headers = Vec::with_capacity(hcount);
+                    for _ in 0..hcount {
+                        let k = read_lp(payload, &mut p);
+                        let v = read_lp(payload, &mut p);
+                        headers.push((k, v));
+                    }
+                    DecodedEvent::Authorize {
+                        request_id: conn_id.0,
+                        client_ip,
+                        url,
+                        headers,
+                    }
+                }
                 other => panic!("corrupt flush buffer: unknown kind {other}"),
             });
         }
@@ -244,6 +353,11 @@ mod tests {
         let batch = vec![
             EngineEvent::ConnectionOpened {
                 id: ConnectionId(u64::MAX),
+                auth_request: None,
+            },
+            EngineEvent::ConnectionOpened {
+                id: ConnectionId(77),
+                auth_request: Some(0xDEAD_BEEF_CAFE),
             },
             EngineEvent::Message {
                 id: ConnectionId(1),
@@ -283,11 +397,19 @@ mod tests {
         assert_eq!(
             decoded[0],
             DecodedEvent::Opened {
-                conn_id: ConnectionId(u64::MAX)
+                conn_id: ConnectionId(u64::MAX),
+                auth_request: None,
             }
         );
         assert_eq!(
             decoded[1],
+            DecodedEvent::Opened {
+                conn_id: ConnectionId(77),
+                auth_request: Some(0xDEAD_BEEF_CAFE),
+            }
+        );
+        assert_eq!(
+            decoded[2],
             DecodedEvent::Message {
                 conn_id: ConnectionId(1),
                 is_binary: false,
@@ -295,7 +417,7 @@ mod tests {
             }
         );
         assert_eq!(
-            decoded[2],
+            decoded[3],
             DecodedEvent::Message {
                 conn_id: ConnectionId(9_999_999_999),
                 is_binary: true,
@@ -303,7 +425,7 @@ mod tests {
             }
         );
         assert_eq!(
-            decoded[3],
+            decoded[4],
             DecodedEvent::Message {
                 conn_id: ConnectionId(0),
                 is_binary: false,
@@ -311,7 +433,7 @@ mod tests {
             }
         );
         assert_eq!(
-            decoded[4],
+            decoded[5],
             DecodedEvent::Closed {
                 conn_id: ConnectionId(42),
                 code: 4001,
@@ -319,11 +441,45 @@ mod tests {
             }
         );
         assert_eq!(
-            decoded[5],
+            decoded[6],
             DecodedEvent::Closed {
                 conn_id: ConnectionId(43),
                 code: 1000,
                 reason: b""
+            }
+        );
+    }
+
+    #[test]
+    fn authorize_event_round_trips() {
+        // The authorize request leg: request_id in the conn_id slot, then the
+        // length-prefixed client IP, URL, and header list. Includes a duplicate
+        // header name (XFF) and an empty value to exercise the edges.
+        let batch = vec![EngineEvent::Authorize {
+            request_id: 0x0102_0304_0506_0708,
+            client_ip: "203.0.113.9".into(),
+            url: "/socket?token=abc".into(),
+            headers: vec![
+                ("host".into(), "example.com".into()),
+                ("x-forwarded-for".into(), "203.0.113.9, 10.0.0.1".into()),
+                ("x-empty".into(), "".into()),
+            ],
+        }];
+        let buf = encode_batch(&batch);
+        assert_eq!(buf.len(), encoded_len(&batch));
+
+        let decoded = decode(&buf);
+        assert_eq!(
+            decoded[0],
+            DecodedEvent::Authorize {
+                request_id: 0x0102_0304_0506_0708,
+                client_ip: b"203.0.113.9",
+                url: b"/socket?token=abc",
+                headers: vec![
+                    (&b"host"[..], &b"example.com"[..]),
+                    (&b"x-forwarded-for"[..], &b"203.0.113.9, 10.0.0.1"[..]),
+                    (&b"x-empty"[..], &b""[..]),
+                ],
             }
         );
     }

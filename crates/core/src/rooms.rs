@@ -44,6 +44,9 @@ pub enum MembershipChange {
     NoOp,
     /// Unknown or stale connection id.
     NotFound,
+    /// Join refused: the connection is already in `maxRoomsPerConnection`
+    /// rooms (Phase 1C — enforced in Rust before any per-message work).
+    LimitExceeded,
 }
 
 impl RoomRegistry {
@@ -71,16 +74,28 @@ impl RoomRegistry {
     }
 
     /// Join `id` to `room`. Runs under the connection's shard lock
-    /// (conn-shard → room-map order).
-    pub fn join(&self, conns: &Registry, id: ConnectionId, room: RoomId) -> MembershipChange {
+    /// (conn-shard → room-map order). `max_rooms` (0 = unlimited) is enforced
+    /// here under that same lock (Phase 1C `maxRoomsPerConnection`): the check
+    /// and the insert are atomic w.r.t. this connection's membership, so a
+    /// racing join cannot slip past the cap.
+    pub fn join(
+        &self,
+        conns: &Registry,
+        id: ConnectionId,
+        room: RoomId,
+        max_rooms: u32,
+    ) -> MembershipChange {
         match conns.with_rooms(id, |set| {
-            if set.insert(room.clone()) {
-                // Auto-create on first join.
-                self.rooms.entry(room).or_default().insert(id);
-                MembershipChange::Changed
-            } else {
-                MembershipChange::NoOp
+            if set.contains(&room) {
+                return MembershipChange::NoOp; // already joined — idempotent, no cost
             }
+            if max_rooms != 0 && set.len() as u64 >= max_rooms as u64 {
+                return MembershipChange::LimitExceeded;
+            }
+            set.insert(room.clone());
+            // Auto-create on first join.
+            self.rooms.entry(room).or_default().insert(id);
+            MembershipChange::Changed
         }) {
             Some(change) => change,
             None => MembershipChange::NotFound,

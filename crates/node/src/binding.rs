@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use beamsocket_core::broadcast::FanoutReport;
-use beamsocket_core::config::{BackpressurePolicy, Config};
+use beamsocket_core::config::{BackpressurePolicy, Config, TrustProxy};
 use beamsocket_core::engine::{Engine, SendStatus};
+use beamsocket_core::identity::AuthorizeOutcome;
 use beamsocket_core::ids::ConnectionId;
 use beamsocket_core::metrics::Metrics;
 use beamsocket_core::rooms::MembershipChange;
@@ -42,6 +43,20 @@ pub struct JsConfig {
     pub backpressure_policy: Option<String>,
     pub ping_interval_ms: Option<f64>,
     pub pong_timeout_ms: Option<f64>,
+    // ── Phase 1C ──
+    /// 0 = unlimited. Enforced at the HTTP upgrade (429) before a WS exists.
+    pub max_connections_per_ip: Option<f64>,
+    /// 0 = unlimited. Enforced in `join`, in Rust, before any per-message work.
+    pub max_rooms_per_connection: Option<f64>,
+    /// trustProxy mode: "never" (default) | "always" | "cidrs" (the SDK maps
+    /// `false | true | string[]` onto this).
+    pub trust_proxy_mode: Option<String>,
+    /// CIDR allowlist when `trust_proxy_mode == "cidrs"`.
+    pub trust_proxy_cidrs: Option<Vec<String>>,
+    /// authorize round-trip timeout (ms).
+    pub authorize_timeout_ms: Option<f64>,
+    /// Bounded pending-upgrade table size (Rule 5).
+    pub max_pending_authorizations: Option<f64>,
 }
 
 fn to_config(js: JsConfig) -> Result<Config> {
@@ -70,6 +85,31 @@ fn to_config(js: JsConfig) -> Result<Config> {
     if let Some(v) = js.pong_timeout_ms {
         c.keepalive.pong_timeout = std::time::Duration::from_millis(v as u64);
     }
+    if let Some(v) = js.max_connections_per_ip {
+        c.limits.max_connections_per_ip = v as u32;
+    }
+    if let Some(v) = js.max_rooms_per_connection {
+        c.limits.max_rooms_per_connection = v as u32;
+    }
+    c.trust_proxy = match js.trust_proxy_mode.as_deref() {
+        None | Some("never") => TrustProxy::Never,
+        Some("always") => TrustProxy::Always,
+        Some("cidrs") => TrustProxy::Cidrs(js.trust_proxy_cidrs.unwrap_or_default()),
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "unknown trustProxy mode {other:?}"
+            )))
+        }
+    };
+    if let Some(v) = js.authorize_timeout_ms {
+        c.authorize.timeout = std::time::Duration::from_millis(v as u64);
+    }
+    if let Some(v) = js.max_pending_authorizations {
+        c.authorize.max_pending = v as usize;
+    }
+    // Surface config errors (e.g. a malformed trustProxy CIDR) at construction.
+    c.validate()
+        .map_err(|e| Error::from_reason(e.to_string()))?;
     Ok(c)
 }
 
@@ -78,17 +118,28 @@ fn to_config(js: JsConfig) -> Result<Config> {
 #[napi(object)]
 pub struct JsStats {
     pub connections: f64,
+    pub users: f64,
     pub messages_in: f64,
     pub messages_out: f64,
     pub bytes_in: f64,
     pub bytes_out: f64,
     pub backpressure_drops: f64,
     pub bridge_dropped: f64,
+    // Phase 1C admission-control rejections (every reject is counted).
+    pub admission_rejected_ip: f64,
+    pub authorize_rejected: f64,
+    pub authorize_timed_out: f64,
+    pub pending_overflow: f64,
+}
+
+#[inline]
+fn halves_to_u64(hi: u32, lo: u32) -> u64 {
+    ((hi as u64) << 32) | lo as u64
 }
 
 #[inline]
 fn conn_id(hi: u32, lo: u32) -> ConnectionId {
-    ConnectionId(((hi as u64) << 32) | lo as u64)
+    ConnectionId(halves_to_u64(hi, lo))
 }
 
 #[napi]
@@ -106,9 +157,14 @@ impl BeamEngine {
     /// batching at BRIDGE_BATCH/BRIDGE_FLUSH_INTERVAL, one Blocking TSFN call
     /// per flush carrying one flat-encoded buffer.
     #[napi(factory)]
-    pub fn start(cfg: JsConfig, on_flush: JsFunction) -> Result<BeamEngine> {
+    pub fn start(cfg: JsConfig, has_authorize: bool, on_flush: JsFunction) -> Result<BeamEngine> {
         let config = to_config(cfg)?;
-        let (engine, rx) = Engine::start(config, ENGINE_BRIDGE_QUEUE_CAPACITY)
+        // Authorize requests ride the SAME batched design-C bridge (a new kind
+        // byte, no second channel); JS replies out-of-band via `resolveAuthorize`
+        // (a flat command like send/join). `has_authorize` tells the engine
+        // whether to run the round-trip at all — no hook means accept-all with
+        // no JS involvement (Rule 1).
+        let (engine, rx) = Engine::start(config, ENGINE_BRIDGE_QUEUE_CAPACITY, has_authorize)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let metrics = engine.metrics();
 
@@ -302,18 +358,92 @@ impl BeamEngine {
         Ok(self.engine()?.room_count() as f64)
     }
 
+    // ── Phase 1C: identity + authorize ──
+
+    /// JS's reply to an `authorize` request (delivered via the batched bridge).
+    /// `accept` + optional `userId` bind the connection; otherwise `code` is the
+    /// close code. One flat command, like send/join — the round-trip is the
+    /// engine's, this is just the return leg. `req_hi`/`req_lo` are the
+    /// request_id halves (u64 across the FFI as two u32s, same as conn ids).
     #[napi]
-    pub fn stats(&self) -> JsStats {
+    pub fn resolve_authorize(
+        &self,
+        req_hi: u32,
+        req_lo: u32,
+        accept: bool,
+        user_id: String,
+        has_user_id: bool,
+        code: u32,
+    ) -> Result<()> {
+        let outcome = if accept {
+            AuthorizeOutcome::Accept {
+                user_id: has_user_id.then_some(user_id),
+            }
+        } else {
+            AuthorizeOutcome::Reject { code: code as u16 }
+        };
+        self.engine()?
+            .resolve_authorize(halves_to_u64(req_hi, req_lo), outcome);
+        Ok(())
+    }
+
+    /// Fan out to every device of a user (`io.toUser(id).send()`). One FFI call;
+    /// fan-out runs entirely in Rust over the sharded identity index.
+    #[napi]
+    pub fn broadcast_user(
+        &self,
+        user_id: String,
+        data: Buffer,
+        is_binary: bool,
+        except: Uint32Array,
+    ) -> Result<JsFanout> {
+        let engine = self.engine()?;
+        Ok(engine
+            .broadcast_user(
+                &user_id,
+                bytes::Bytes::from(data.to_vec()),
+                is_binary,
+                &except_ids(&except),
+            )
+            .into())
+    }
+
+    /// Text fast path for user fan-out.
+    #[napi]
+    pub fn broadcast_text_user(
+        &self,
+        user_id: String,
+        data: String,
+        except: Uint32Array,
+    ) -> Result<JsFanout> {
+        let engine = self.engine()?;
+        Ok(engine
+            .broadcast_user(
+                &user_id,
+                bytes::Bytes::from(data.into_bytes()),
+                false,
+                &except_ids(&except),
+            )
+            .into())
+    }
+
+    #[napi]
+    pub fn stats(&self) -> Result<JsStats> {
         let m = &self.metrics;
-        JsStats {
+        Ok(JsStats {
             connections: m.connections.load(Ordering::Relaxed) as f64,
+            users: self.engine()?.user_count() as f64,
             messages_in: m.messages_in.load(Ordering::Relaxed) as f64,
             messages_out: m.messages_out.load(Ordering::Relaxed) as f64,
             bytes_in: m.bytes_in.load(Ordering::Relaxed) as f64,
             bytes_out: m.bytes_out.load(Ordering::Relaxed) as f64,
             backpressure_drops: m.backpressure_drops.load(Ordering::Relaxed) as f64,
             bridge_dropped: m.bridge_dropped.load(Ordering::Relaxed) as f64,
-        }
+            admission_rejected_ip: m.admission_rejected_ip.load(Ordering::Relaxed) as f64,
+            authorize_rejected: m.authorize_rejected.load(Ordering::Relaxed) as f64,
+            authorize_timed_out: m.authorize_timed_out.load(Ordering::Relaxed) as f64,
+            pending_overflow: m.pending_overflow.load(Ordering::Relaxed) as f64,
+        })
     }
 
     /// Phase 1A teardown: stop accepting, sweep-close (1001), background
@@ -351,6 +481,8 @@ fn membership_code(c: MembershipChange) -> u32 {
         MembershipChange::Changed => 0,
         MembershipChange::NoOp => 1,
         MembershipChange::NotFound => 2,
+        // Phase 1C: join refused by maxRoomsPerConnection.
+        MembershipChange::LimitExceeded => 3,
     }
 }
 
