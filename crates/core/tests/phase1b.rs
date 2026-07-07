@@ -22,7 +22,7 @@ use beamsocket_core::metrics::Metrics;
 use beamsocket_core::rooms::{MembershipChange, RoomRegistry};
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -133,7 +133,7 @@ proptest! {
     }
 }
 
-fn dead_id(ids: &[Option<ConnectionId>], _c: u8) -> Option<ConnectionId> {
+fn dead_id(_ids: &[Option<ConnectionId>], _c: u8) -> Option<ConnectionId> {
     // Any currently-dead id would do; absence just skips the stale check.
     None
 }
@@ -286,7 +286,7 @@ fn rooms_broadcast_end_to_end() {
         let (mut c2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let id2 = ids_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (mut c3, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        let id3 = ids_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let _id3 = ids_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         // c1, c2 in the room; c3 out. Idempotent double-join is a no-op.
         assert_eq!(engine.join(id1, "lobby"), MembershipChange::Changed);

@@ -153,6 +153,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    // These tests deliberately build a default config and mutate ONE field to
+    // prove `validate()` rejects it — struct-update syntax would obscure that.
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::*;
 
     #[test]

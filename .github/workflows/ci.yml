@@ -11,10 +11,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace -- -D warnings
+      # --all-targets lints test/bench/example targets too, so test-only
+      # warnings can't slip through (Phase 1D hygiene).
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       # The napi surface only compiles under --features napi (kept out of the
       # default build so test binaries never link Node symbols); lint it too.
-      - run: cargo clippy -p beamsocket-node --features napi -- -D warnings
+      - run: cargo clippy -p beamsocket-node --features napi --all-targets -- -D warnings
       - run: cargo test --workspace
       # Spike is its own workspace:
       - run: cargo test --manifest-path spike/Cargo.toml --workspace
