@@ -24,6 +24,7 @@ use crate::identity::{AuthorizeOutcome, AuthorizeResolution, Authorizer, Identit
 use crate::ids::{ConnectionId, RoomId, UserId};
 use crate::limits::{ClientIpResolver, Gate, IpLimiter};
 use crate::metrics::Metrics;
+use crate::presence::{LocalPresence, PresenceEntry, PresenceStore};
 use crate::rooms::{MembershipChange, RoomRegistry};
 use crate::transport::{Accepted, FrameSink, OutFrame, Transport, WebSocketTransport};
 
@@ -305,8 +306,22 @@ impl Engine {
         self.gate.tracked_ips()
     }
 
+    // ── Phase 1D: presence ──
+
+    /// The `(connectionId, userId)` pairs of a room's live members (Phase 1D).
+    /// Metadata is joined SDK-side (it lives in JS). One call; the SDK makes one
+    /// FFI hop for the whole room.
+    pub fn presence_list(&self, room: &str) -> Vec<PresenceEntry> {
+        LocalPresence.room_presence(&self.rooms, &self.registry, &RoomId(room.to_owned()))
+    }
+
     pub fn room_count(&self) -> usize {
         self.rooms.room_count()
+    }
+
+    /// Bridge back-pressure gauge (`metrics().bridgePressure`), 0.0..=1.0.
+    pub fn bridge_pressure(&self) -> f64 {
+        self.events.pressure()
     }
 
     /// Membership size of one room (diagnostics/tests).
@@ -342,9 +357,51 @@ impl Engine {
         }
     }
 
+    /// Graceful close (Phase 1D). BLOCKS the calling thread until drained or the
+    /// timeout — the napi binding runs this on the libuv threadpool, never the
+    /// Node loop. Sequence: stop admitting (new upgrades → 503) → sweep-close
+    /// every live connection (1001) → wait up to `timeout` for in-flight writes
+    /// to flush and sockets to close → force-close stragglers (1001) → stop the
+    /// accept loop and the runtime. Consuming `self` drops the engine's
+    /// `EventSender`s, which closes the engine→bridge channel so the bridge drain
+    /// thread exits and releases the `ThreadsafeFunction` — the precondition for
+    /// the Node process to exit on its own.
+    pub fn close(mut self, timeout: Duration) {
+        use std::time::Instant;
+        // 1. New upgrades → 503; the accept loop stays up to answer them.
+        self.gate.set_draining(true);
+        // 2. Ask every live connection to close gracefully (1001 going away):
+        //    the write loop flushes its mailbox, sends Close, and awaits the
+        //    peer's ack (bounded by CLOSE_GRACE).
+        for (_, handle) in self.registry.handles() {
+            handle.initiate_close(CLOSE_GOING_AWAY, "server draining", true);
+        }
+        // 3. Wait for the sockets to drain, up to the caller's timeout.
+        let deadline = Instant::now() + timeout;
+        while !self.registry.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 4. Force-close stragglers still open at the timeout (non-graceful,
+        //    still reported 1001 going away).
+        for (_, handle) in self.registry.handles() {
+            handle.initiate_close(CLOSE_GOING_AWAY, "drain timeout", false);
+        }
+        // 5. Stop accepting entirely and tear the runtime down. A short grace
+        //    lets stragglers' Closed events flush to the bridge first.
+        let _ = self.shutdown_tx.send(true);
+        if let Some(runtime) = self.runtime.take() {
+            let hard = Instant::now() + Duration::from_millis(200);
+            while !self.registry.is_empty() && Instant::now() < hard {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            runtime.shutdown_timeout(Duration::from_secs(1));
+        }
+        // self dropped here → EventSenders gone → bridge channel closes.
+    }
+
     /// Stop accepting, sweep-close every connection (1001 going away), then
     /// tear the runtime down in the background. NEVER blocks the caller
-    /// (the Node event loop) — full drain semantics are Phase 1D.
+    /// (the Node event loop). Abrupt counterpart to `close` — no drain wait.
     pub fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true); // accept loop exits
         for (_, handle) in self.registry.handles() {
@@ -469,7 +526,9 @@ async fn setup_connection<T: Transport>(
         control: control_tx,
         close,
     };
-    let id = registry.insert(handle.clone());
+    // Store the userId in the registry entry (conn→user, for presence) as well
+    // as the sharded user index (user→conns, for toUser).
+    let id = registry.insert(handle.clone(), user_id.clone());
     Metrics::add(&ctx.metrics.connections, 1);
     // Bind identity BEFORE Opened fires so `toUser` can reach a brand-new
     // device immediately. Unbound below on disconnect.

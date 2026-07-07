@@ -88,6 +88,8 @@ export type AuthorizeResult =
 export const RejectCode = {
   /** `maxConnectionsPerIp` hit at the HTTP upgrade — HTTP 429, no WebSocket. */
   TOO_MANY_CONNECTIONS_PER_IP: 429,
+  /** New upgrade during a graceful `close()` drain — HTTP 503, no WebSocket. */
+  SERVICE_UNAVAILABLE: 503,
   /** `authorize` returned `{ accept: false }` with no `code`: default policy
    * rejection (WebSocket close 1008). Apps may return any code, including the
    * 4000–4999 application range (e.g. 4401 unauthenticated, 4403 forbidden). */
@@ -102,18 +104,46 @@ export const RejectCode = {
 
 export type RejectCode = (typeof RejectCode)[keyof typeof RejectCode];
 
-/** Snapshot from lock-free Rust counters. (Phase 1D) */
+/**
+ * One-FFI-call snapshot from lock-free Rust atomics (Phase 1D). Every field is
+ * named here — there are no undocumented counters. Per-connection metrics cost
+ * is ~zero: these are process-global atomics, not per-connection state.
+ */
 export interface Metrics {
+  /** Live connections (gauge). */
   connections: number;
+  /** Distinct users with ≥1 live connection (gauge). */
   users: number;
+  /** Live rooms (gauge; empty rooms auto-destroy). */
   rooms: number;
   messagesIn: number;
   messagesOut: number;
   bytesIn: number;
   bytesOut: number;
+  /** Frames dropped / connections cut by a send-queue backpressure policy. */
   backpressureDrops: number;
-  /** Rises when the Rust→JS bridge saturates. Watch this in production. */
+  /**
+   * Rust→JS bridge saturation: in-flight depth ÷ capacity of the bounded
+   * engine→bridge queue (0..1). Rises when the JS consumer falls behind — watch
+   * this in production; sustained highs precede `bridgeDropped` climbing.
+   */
   bridgePressure: number;
+  /** `message` events shed at the bounded engine→bridge queue (drop-newest). */
+  bridgeDropped: number;
+  /** Handshakes rejected by `maxConnectionsPerIp` (HTTP 429). */
+  admissionRejectedIp: number;
+  /** Connections closed by `authorize` returning `{ accept: false }`. */
+  authorizeRejected: number;
+  /** Connections closed because `authorize` never settled within its timeout. */
+  authorizeTimedOut: number;
+  /** Handshakes shed because the bounded pending-upgrade table was full. */
+  pendingOverflow: number;
+  /**
+   * FIFO evictions from the JS-side authorize-metadata correlation map
+   * (server.ts `PENDING_AUTH_CAP`). A nonzero, growing value means some
+   * accepted connections opened with `{}` metadata; identity is unaffected.
+   */
+  authMetadataEvicted: number;
 }
 
 export interface PresenceEntry {

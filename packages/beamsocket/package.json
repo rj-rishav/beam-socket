@@ -1,17 +1,36 @@
 {
   "name": "beamsocket",
-  "version": "0.0.0",
+  "version": "0.1.0-alpha.0",
   "description": "The high-performance networking runtime for Node.js.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": ["dist", "native"],
+  "napi": {
+    "binaryName": "beamsocket",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:native": "cargo build -p beamsocket-node --release --features napi && node scripts/copy-native.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test __tests__/"
+  },
+  "optionalDependencies": {
+    "beamsocket-linux-x64-gnu": "0.1.0-alpha.0",
+    "beamsocket-linux-x64-musl": "0.1.0-alpha.0",
+    "beamsocket-linux-arm64-gnu": "0.1.0-alpha.0",
+    "beamsocket-linux-arm64-musl": "0.1.0-alpha.0",
+    "beamsocket-darwin-arm64": "0.1.0-alpha.0",
+    "beamsocket-win32-x64-msvc": "0.1.0-alpha.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

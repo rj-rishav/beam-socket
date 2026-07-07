@@ -119,11 +119,14 @@ fn to_config(js: JsConfig) -> Result<Config> {
 pub struct JsStats {
     pub connections: f64,
     pub users: f64,
+    pub rooms: f64,
     pub messages_in: f64,
     pub messages_out: f64,
     pub bytes_in: f64,
     pub bytes_out: f64,
     pub backpressure_drops: f64,
+    /// Rust→JS bridge saturation gauge (in-flight ÷ capacity), 0.0..=1.0.
+    pub bridge_pressure: f64,
     pub bridge_dropped: f64,
     // Phase 1C admission-control rejections (every reject is counted).
     pub admission_rejected_ip: f64,
@@ -427,12 +430,37 @@ impl BeamEngine {
             .into())
     }
 
+    // ── Phase 1D: presence ──
+
+    /// The (connectionId halves, userId) pairs of a room's live members — ONE
+    /// FFI call. The SDK joins metadata (which lives in JS) per entry.
+    #[napi]
+    pub fn presence_list(&self, room: String) -> Result<Vec<JsPresenceEntry>> {
+        let engine = self.engine()?;
+        Ok(engine
+            .presence_list(&room)
+            .into_iter()
+            .map(|e| {
+                let has_user_id = e.user.is_some();
+                JsPresenceEntry {
+                    id_hi: (e.id.0 >> 32) as u32,
+                    id_lo: e.id.0 as u32,
+                    user_id: e.user.map(|u| u.0).unwrap_or_default(),
+                    has_user_id,
+                }
+            })
+            .collect())
+    }
+
     #[napi]
     pub fn stats(&self) -> Result<JsStats> {
+        let engine = self.engine()?;
         let m = &self.metrics;
         Ok(JsStats {
             connections: m.connections.load(Ordering::Relaxed) as f64,
-            users: self.engine()?.user_count() as f64,
+            users: engine.user_count() as f64,
+            rooms: engine.room_count() as f64,
+            bridge_pressure: engine.bridge_pressure(),
             messages_in: m.messages_in.load(Ordering::Relaxed) as f64,
             messages_out: m.messages_out.load(Ordering::Relaxed) as f64,
             bytes_in: m.bytes_in.load(Ordering::Relaxed) as f64,
@@ -446,9 +474,25 @@ impl BeamEngine {
         })
     }
 
-    /// Phase 1A teardown: stop accepting, sweep-close (1001), background
-    /// runtime stop. Never blocks the Node loop; full drain semantics are
-    /// Phase 1D. Idempotent.
+    /// Graceful close (Phase 1D): stop admitting (new upgrades → 503), drain
+    /// existing sockets, force-close stragglers at `timeoutMs`, stop the
+    /// runtime, and RELEASE the ThreadsafeFunction so the Node process exits on
+    /// its own. Returns a Promise — the drain runs on the libuv threadpool, so
+    /// the Node loop is never blocked for the timeout window (and stays free to
+    /// service the bridge's final TSFN callbacks, which is what lets the join
+    /// below complete). Idempotent: a second call resolves immediately.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn close(&mut self, timeout_ms: f64) -> AsyncTask<CloseTask> {
+        AsyncTask::new(CloseTask {
+            engine: self.engine.take(),
+            drain: self.drain.take(),
+            timeout: std::time::Duration::from_millis(timeout_ms.max(0.0) as u64),
+        })
+    }
+
+    /// Abrupt teardown: stop accepting, sweep-close (1001), background runtime
+    /// stop. Never blocks the Node loop and does NOT wait for a drain — prefer
+    /// `close` for graceful shutdown. Idempotent.
     #[napi]
     pub fn shutdown(&mut self) {
         if let Some(engine) = self.engine.take() {
@@ -510,5 +554,50 @@ impl From<FanoutReport> for JsFanout {
             backpressured: r.backpressured as f64,
             missing: r.missing as f64,
         }
+    }
+}
+
+/// One presence entry (Phase 1D). connectionId crosses as two u32 halves; the
+/// SDK joins `metadata` (which lives in JS) by connection id.
+#[napi(object)]
+pub struct JsPresenceEntry {
+    pub id_hi: u32,
+    pub id_lo: u32,
+    pub user_id: String,
+    pub has_user_id: bool,
+}
+
+/// Backs `BeamEngine::close` (Phase 1D). Runs the graceful drain on the libuv
+/// threadpool (`compute`), off the Node loop, then joins the bridge drain thread
+/// so the ThreadsafeFunction is fully released before the Promise resolves —
+/// this is the "process exits by itself" guarantee.
+pub struct CloseTask {
+    engine: Option<Engine>,
+    drain: Option<std::thread::JoinHandle<()>>,
+    timeout: std::time::Duration,
+}
+
+impl Task for CloseTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<()> {
+        // Off the Node loop. Consuming the engine drains sockets and closes the
+        // engine→bridge channel.
+        if let Some(engine) = self.engine.take() {
+            engine.close(self.timeout);
+        }
+        // Channel closed → the bridge drain loop returns and drops the TSFN.
+        // Join it so no dangling TSFN keeps the event loop referenced. Safe to
+        // join here (we are on the threadpool, not the Node thread, which stays
+        // free to service the bridge's final callbacks).
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, _env: Env, _output: ()) -> Result<()> {
+        Ok(())
     }
 }

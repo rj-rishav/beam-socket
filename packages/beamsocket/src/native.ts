@@ -15,11 +15,13 @@ const requireNative = createRequire(import.meta.url);
 export interface NativeStats {
   connections: number;
   users: number;
+  rooms: number;
   messagesIn: number;
   messagesOut: number;
   bytesIn: number;
   bytesOut: number;
   backpressureDrops: number;
+  bridgePressure: number;
   bridgeDropped: number;
   admissionRejectedIp: number;
   authorizeRejected: number;
@@ -63,6 +65,14 @@ export interface NativeFanout {
   missing: number;
 }
 
+/** One room-presence row (Phase 1D). Metadata is joined SDK-side. */
+export interface NativePresenceEntry {
+  idHi: number;
+  idLo: number;
+  userId: string;
+  hasUserId: boolean;
+}
+
 export interface NativeEngine {
   listen(port: number): number;
   send(idHi: number, idLo: number, data: Buffer, isBinary: boolean): number;
@@ -70,6 +80,8 @@ export interface NativeEngine {
   closeConnection(idHi: number, idLo: number, code: number, reason: string): boolean;
   connectionCount(): number;
   stats(): NativeStats;
+  /** Graceful drain + release the TSFN; resolves when the runtime is down. */
+  close(timeoutMs: number): Promise<void>;
   shutdown(): void;
   // Phase 1B — each call is ONE FFI hop; fan-out runs in Rust.
   join(idHi: number, idLo: number, room: string): number;
@@ -92,6 +104,8 @@ export interface NativeEngine {
   ): void;
   broadcastUser(userId: string, data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
   broadcastTextUser(userId: string, data: string, except: Uint32Array): NativeFanout;
+  // Phase 1D — presence. One FFI call returns the room's (id, userId) pairs.
+  presenceList(room: string): NativePresenceEntry[];
 }
 
 export interface NativeModule {
@@ -102,22 +116,45 @@ export interface NativeModule {
   };
 }
 
+/** Local candidate .node file paths (env override → local dev build). */
 export function nativeCandidates(): string[] {
   const local = fileURLToPath(new URL('../native/beamsocket.node', import.meta.url));
   return process.env.BEAMSOCKET_NATIVE ? [process.env.BEAMSOCKET_NATIVE, local] : [local];
 }
 
+/**
+ * The napi-rs per-platform prebuild package name(s) for this host (Phase 1D).
+ * Resolves to one of the `optionalDependencies` installed by npm for the
+ * running platform. Linux returns both libc variants (gnu, then musl) so we
+ * don't depend on flaky musl detection — whichever is installed wins.
+ */
+export function platformPackages(): string[] {
+  const { platform, arch } = process;
+  if (platform === 'linux') {
+    return [`beamsocket-linux-${arch}-gnu`, `beamsocket-linux-${arch}-musl`];
+  }
+  if (platform === 'darwin') return [`beamsocket-darwin-${arch}`];
+  if (platform === 'win32') return [`beamsocket-win32-${arch}-msvc`];
+  return [];
+}
+
 export function loadNative(): NativeModule {
-  const candidates = nativeCandidates();
-  for (const p of candidates) {
-    if (existsSync(p)) {
-      return requireNative(p) as NativeModule;
+  // 1. Env override / local dev build (native/beamsocket.node).
+  for (const p of nativeCandidates()) {
+    if (existsSync(p)) return requireNative(p) as NativeModule;
+  }
+  // 2. Published per-platform prebuild package (optionalDependencies).
+  for (const pkg of platformPackages()) {
+    try {
+      return requireNative(pkg) as NativeModule;
+    } catch {
+      // not installed for this platform — try the next candidate
     }
   }
   throw new Error(
-    `beamsocket native addon not found (looked at: ${candidates.join(', ')}). ` +
-      'Build with `cargo build -p beamsocket-node --release --features napi`, then copy ' +
-      'target/release/libbeamsocket_node.so to packages/beamsocket/native/beamsocket.node ' +
-      '(or set BEAMSOCKET_NATIVE to the .node file).',
+    'beamsocket native addon not found. For local development build it with ' +
+      '`npm run build:native -w beamsocket` (or set BEAMSOCKET_NATIVE to the .node file). ' +
+      `For a published install, the prebuild package for ${process.platform}-${process.arch} ` +
+      `(${platformPackages().join(' / ') || 'unsupported platform'}) was not resolvable.`,
   );
 }

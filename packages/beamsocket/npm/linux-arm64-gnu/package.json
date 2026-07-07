@@ -1,0 +1,12 @@
+{
+  "name": "beamsocket-linux-arm64-gnu",
+  "version": "0.1.0-alpha.0",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["glibc"],
+  "main": "beamsocket.linux-arm64-gnu.node",
+  "files": ["beamsocket.linux-arm64-gnu.node"],
+  "description": "Prebuilt beamsocket native addon for linux-arm64-glibc.",
+  "license": "MIT",
+  "engines": { "node": ">= 18" }
+}
