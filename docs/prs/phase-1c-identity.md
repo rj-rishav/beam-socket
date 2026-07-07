@@ -63,7 +63,7 @@ JS runs.
 
 | Gate | Status |
 |---|---|
-| `toUser` fan-out entirely in Rust; identity cost measured & published | ✅ `FanoutTarget::User` reuses the 1B path; **~20.5 B/connection** measured (below the 24–40 B target) — see Rule 4 |
+| `toUser` fan-out entirely in Rust; identity cost measured & published | ✅ `FanoutTarget::User` reuses the 1B path; **~278 B/conn** worst case (all single-device users) → **~20.5 B/conn** amortized (multi-device) measured — see Rule 4 |
 | Multi-device: 1 user, 3 conns → `toUser` reaches 3; one leaves → 2; last leaves → entry gone | ✅ `tests/phase1c.rs::multi_device_to_user_reaches_every_device` + JS integration |
 | Leak: 10k connect/disconnect churn → index empty, RSS flat | ✅ `churn_leaves_identity_and_ip_tables_empty_rss_flat`: `user_count==0`, `tracked_ips==0`, RSS delta +228 KB / 10k cycles (≈23 B/cycle, allocator noise) |
 | Spoof: untrusted XFF ignored; trusted honored right-to-left; mixed hops | ✅ 9 resolver unit tests in `limits.rs` + proven end-to-end via the proxy per-IP test |
@@ -86,14 +86,18 @@ JS runs.
 - **Rule 3 — works behind a load balancer.** `trustProxy` + `X-Forwarded-For`
   resolution is the whole point; the per-IP limit is tested in BOTH direct and
   simulated-proxy topologies, in Rust and JS.
-- **Rule 4 — memory cost stated.** Identity index: **~20.5 B/connection**
-  measured for the multi-device hot path (a `ConnectionId` in the user's shared
-  `HashSet` + load-factor slack; `identity_memory_cost_measurement`, 500k
-  devices). Worst case — every connection a distinct single-device user — is
-  ~278 B/conn (dominated by the per-user `DashMap` entry + `HashSet` allocation +
-  userId string), amortized toward the 20 B figure as soon as a user has more
-  than one device. Per-IP limiter: one `DashMap` entry per *active* IP only
-  (idle IPs cost nothing).
+- **Rule 4 — memory cost stated (worst case first).** Identity index worst
+  case — every connection a distinct *single-device* user — is **~278
+  B/connection**: it is dominated by the per-*user* cost (a `DashMap` entry + a
+  fresh `HashSet` allocation + the userId string), which every connection pays
+  in full when no user is shared. That per-user cost **amortizes toward
+  ~20.5 B/connection** as soon as a user has more than one device — the
+  multi-device hot path, where the marginal cost is just a `ConnectionId` in the
+  user's already-allocated shared `HashSet` plus load-factor slack
+  (`identity_memory_cost_measurement`, 500k devices, both cases). The honest
+  headline is therefore *~278 B for the pathological all-singletons workload,
+  ~20 B amortized for real multi-device users.* Per-IP limiter: one `DashMap`
+  entry per *active* IP only (idle IPs cost nothing).
 - **Rule 5 — every queue bounded.** The pending-upgrade table is bounded
   (`authorize.maxPending`, overflow counted in `metrics.pending_overflow`); the
   JS-side authorize correlation map is bounded (`PENDING_AUTH_CAP`). Every
