@@ -26,6 +26,13 @@ interface PendingAuth {
  * a bridge flush of the accept, so this only guards the pathological
  * accepted-but-never-opened case (the connection dropped in the microseconds
  * between). Keeping it bounded is the same Rule 5 discipline as the Rust side.
+ *
+ * On `PENDING_AUTH_CAP` overflow the oldest entry is evicted (FIFO); eviction
+ * costs at most that connection's `socket.metadata` (it opens with `{}`), never
+ * its identity, which Rust owns — the `userId` was already bound in the engine
+ * and drives `toUser` regardless. Evict-oldest degrades gracefully; rejecting
+ * the new entry would instead deny a working feature to a healthy connection to
+ * preserve stale junk. Evictions are counted (`metrics().authMetadataEvicted`).
  */
 const PENDING_AUTH_CAP = 16384;
 
@@ -75,6 +82,8 @@ export class BeamSocket extends EventEmitter {
   #authorizeFn?: AuthorizeFn;
   /** request_id → the userId/metadata to attach when its Opened arrives. */
   #pendingAuth = new Map<string, PendingAuth>();
+  /** FIFO evictions from #pendingAuth (surfaced via metrics().authMetadataEvicted). */
+  #authMetadataEvicted = 0;
 
   constructor(config: BeamSocketConfig = {}) {
     super();
@@ -244,11 +253,18 @@ export class BeamSocket extends EventEmitter {
       });
   }
 
-  /** Keep the JS-side correlation map bounded (Rule 5 on both sides). */
+  /**
+   * Keep the JS-side correlation map bounded (Rule 5 on both sides). Evict the
+   * OLDEST entry on overflow — it costs at most that connection's metadata, not
+   * its identity (see PENDING_AUTH_CAP). Counted for observability.
+   */
   #capPendingAuth(): void {
     if (this.#pendingAuth.size > PENDING_AUTH_CAP) {
       const oldest = this.#pendingAuth.keys().next().value;
-      if (oldest !== undefined) this.#pendingAuth.delete(oldest);
+      if (oldest !== undefined) {
+        this.#pendingAuth.delete(oldest);
+        this.#authMetadataEvicted++;
+      }
     }
   }
 }
