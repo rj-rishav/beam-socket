@@ -15,6 +15,9 @@
 //! runtime plays the JS side, replying to `Authorize` events via
 //! `engine.resolve_authorize` — the same seam the napi binding uses.
 
+// Tests build a default Config and mutate individual fields on purpose.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

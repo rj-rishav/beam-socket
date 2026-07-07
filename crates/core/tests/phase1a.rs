@@ -5,6 +5,9 @@
 //! - real-socket echo + clean close both directions through the engine → here
 //!   (the JS-client version lives in packages/beamsocket/__tests__)
 
+// Tests build a default Config and mutate individual fields on purpose.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
