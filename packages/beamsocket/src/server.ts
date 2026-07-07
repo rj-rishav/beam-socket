@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 
 import type { AuthorizeRequest, AuthorizeResult, BeamSocketConfig, CloseOptions, Metrics } from './types.js';
 import { RejectCode } from './types.js';
+import { BoundedMetaMap } from './correlation.js';
 import { demux } from './events.js';
 import { decodeSocketId } from './ids.js';
 import { loadNative, type NativeConfig, type NativeEngine } from './native.js';
@@ -80,10 +81,11 @@ export class BeamSocket extends EventEmitter {
   #sockets = new Map<string, Socket>();
   #listening = false;
   #authorizeFn?: AuthorizeFn;
-  /** request_id → the userId/metadata to attach when its Opened arrives. */
-  #pendingAuth = new Map<string, PendingAuth>();
-  /** FIFO evictions from #pendingAuth (surfaced via metrics().authMetadataEvicted). */
-  #authMetadataEvicted = 0;
+  /**
+   * request_id → the userId/metadata to attach when its Opened arrives.
+   * FIFO-bounded (evict-oldest); see BoundedMetaMap / PENDING_AUTH_CAP.
+   */
+  #pendingAuth = new BoundedMetaMap<PendingAuth>(PENDING_AUTH_CAP);
 
   constructor(config: BeamSocketConfig = {}) {
     super();
@@ -135,12 +137,35 @@ export class BeamSocket extends EventEmitter {
     new Target(this.#requireEngine('broadcast'), { type: 'all' }).send(data);
   }
 
+  /** Room presence — `[{ id, userId, metadata }]`. (Phase 1D) */
   presence(room: string): Presence {
-    return new Presence(room);
+    return new Presence(this.#requireEngine('presence'), room, (hi, lo) => {
+      // Metadata lives on the live Socket; absent (evicted / remote) → {}.
+      return this.#sockets.get(socketKey(hi, lo))?.metadata ?? {};
+    });
   }
 
+  /** One-FFI-call snapshot of the runtime counters (Phase 1D). */
   metrics(): Metrics {
-    throw new Error('Not implemented until Phase 1D — docs/ENGINEERING.md §8');
+    const s = this.#requireEngine('metrics').stats();
+    return {
+      connections: s.connections,
+      users: s.users,
+      rooms: s.rooms,
+      messagesIn: s.messagesIn,
+      messagesOut: s.messagesOut,
+      bytesIn: s.bytesIn,
+      bytesOut: s.bytesOut,
+      backpressureDrops: s.backpressureDrops,
+      bridgePressure: s.bridgePressure,
+      bridgeDropped: s.bridgeDropped,
+      admissionRejectedIp: s.admissionRejectedIp,
+      authorizeRejected: s.authorizeRejected,
+      authorizeTimedOut: s.authorizeTimedOut,
+      pendingOverflow: s.pendingOverflow,
+      // JS-owned counter (the correlation map lives here, not in Rust).
+      authMetadataEvicted: this.#pendingAuth.evicted,
+    };
   }
 
   /**
@@ -164,12 +189,19 @@ export class BeamSocket extends EventEmitter {
   }
 
   /**
-   * Phase 1A teardown: stop accepting, close every connection (1001), stop
-   * the engine. Graceful drain semantics (`timeoutMs`) land in Phase 1D.
+   * Graceful shutdown (Phase 1D): stop accepting (new upgrades get HTTP 503),
+   * drain in-flight sockets, force-close stragglers at `timeoutMs` (default
+   * 30 s) with 1001, then stop the engine and release the bridge. Resolves once
+   * the runtime is down — after which the Node process can exit on its own.
    */
-  async close(_opts: CloseOptions = {}): Promise<void> {
-    this.#engine?.shutdown();
+  async close(opts: CloseOptions = {}): Promise<void> {
+    const engine = this.#engine;
+    if (!engine) return;
+    // Prevent re-entrancy and drop references so nothing races the drain.
     this.#engine = undefined;
+    this.#sockets.clear();
+    this.#pendingAuth.clear();
+    await engine.close(opts.timeoutMs ?? 30_000);
   }
 
   #requireEngine(method: string): NativeEngine {
@@ -189,9 +221,7 @@ export class BeamSocket extends EventEmitter {
         // connection (correlated by request_id); absent for accept-all.
         let info: PendingAuth | undefined;
         if (authReq) {
-          const key = reqKey(authReq.hi, authReq.lo);
-          info = this.#pendingAuth.get(key);
-          this.#pendingAuth.delete(key);
+          info = this.#pendingAuth.take(reqKey(authReq.hi, authReq.lo));
         }
         const socket = new Socket(engine, hi, lo, info?.userId, info?.metadata);
         this.#sockets.set(socket.id, socket);
@@ -232,9 +262,11 @@ export class BeamSocket extends EventEmitter {
       .then(() => fn(req))
       .then((result) => {
         if (result.accept) {
-          const key = reqKey(reqHi, reqLo);
-          this.#pendingAuth.set(key, { userId: result.userId, metadata: result.metadata });
-          this.#capPendingAuth();
+          // FIFO-bounded internally; over-cap evicts the oldest (metadata only).
+          this.#pendingAuth.set(reqKey(reqHi, reqLo), {
+            userId: result.userId,
+            metadata: result.metadata,
+          });
           engine.resolveAuthorize(
             reqHi,
             reqLo,
@@ -251,21 +283,6 @@ export class BeamSocket extends EventEmitter {
         // A throwing/ rejecting hook must reject the connection, not hang it.
         engine.resolveAuthorize(reqHi, reqLo, false, '', false, RejectCode.AUTH_ERROR);
       });
-  }
-
-  /**
-   * Keep the JS-side correlation map bounded (Rule 5 on both sides). Evict the
-   * OLDEST entry on overflow — it costs at most that connection's metadata, not
-   * its identity (see PENDING_AUTH_CAP). Counted for observability.
-   */
-  #capPendingAuth(): void {
-    if (this.#pendingAuth.size > PENDING_AUTH_CAP) {
-      const oldest = this.#pendingAuth.keys().next().value;
-      if (oldest !== undefined) {
-        this.#pendingAuth.delete(oldest);
-        this.#authMetadataEvicted++;
-      }
-    }
   }
 }
 

@@ -15,6 +15,7 @@
 //! Rule 3: every limit here is tested in direct AND simulated-proxy topologies.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -27,6 +28,11 @@ use crate::metrics::Metrics;
 /// The reject happens during the handshake, before the WebSocket is
 /// established — so it is an HTTP status, not a WebSocket close code.
 pub const HTTP_TOO_MANY_REQUESTS: u16 = 429;
+
+/// HTTP status returned to a new upgrade while the server is draining for a
+/// graceful `close()` (Phase 1D). Existing connections finish; new ones are
+/// turned away before a WebSocket exists.
+pub const HTTP_SERVICE_UNAVAILABLE: u16 = 503;
 
 /// Resolves the client IP from the socket peer address and the (untrusted-by-
 /// default) `X-Forwarded-For` header, per the `trustProxy` policy.
@@ -238,6 +244,10 @@ pub struct Gate {
     resolver: ClientIpResolver,
     limiter: Arc<IpLimiter>,
     metrics: Arc<Metrics>,
+    /// Set during a graceful `close()`: new upgrades are turned away with 503
+    /// (Phase 1D). Shared so the engine can flip it while the accept loop keeps
+    /// running to answer 503s.
+    draining: Arc<AtomicBool>,
 }
 
 /// A successful admission: the resolved client IP, the captured request
@@ -255,7 +265,18 @@ impl Gate {
             resolver,
             limiter,
             metrics,
+            draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Enter/leave the draining state (graceful close). While draining, `admit`
+    /// turns new upgrades away with 503 before touching the IP limiter.
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::Release);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
 
     /// Resolve the client IP for `peer` given the request headers (looks up
@@ -279,6 +300,11 @@ impl Gate {
         headers: Vec<(String, String)>,
         url: String,
     ) -> Result<AdmittedUpgrade, u16> {
+        // Graceful close: turn new upgrades away with 503 before doing any
+        // admission work. Existing connections are unaffected.
+        if self.is_draining() {
+            return Err(HTTP_SERVICE_UNAVAILABLE);
+        }
         let client_ip = self.resolve_client_ip(peer, &headers);
         match self.limiter.try_admit(client_ip) {
             Some(guard) => Ok(AdmittedUpgrade {

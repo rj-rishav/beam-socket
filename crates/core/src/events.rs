@@ -99,6 +99,20 @@ impl EventSender {
         }
     }
 
+    /// Instantaneous bridge back-pressure gauge (Phase 1D `metrics().
+    /// bridgePressure`): in-flight depth ÷ capacity of the bounded engine→bridge
+    /// queue, in `0.0..=1.0`. Rising toward 1.0 means the JS consumer is behind
+    /// and `bridge_dropped` is about to (or already does) climb — the RFC 0001
+    /// saturation signal, now queryable at runtime.
+    pub fn pressure(&self) -> f64 {
+        let max = self.tx.max_capacity();
+        if max == 0 {
+            return 0.0;
+        }
+        let in_flight = max - self.tx.capacity();
+        in_flight as f64 / max as f64
+    }
+
     /// Lossless control event (open/close). Awaits queue space; only ever
     /// blocks the emitting connection task.
     pub async fn control(&self, ev: EngineEvent) {

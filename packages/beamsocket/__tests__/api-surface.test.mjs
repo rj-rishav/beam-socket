@@ -14,12 +14,13 @@ test('API surface', async () => {
   assert.throws(() => io.broadcast('x'), /listen\(\)/);
   assert.throws(() => io.toRoom('lobby'), /listen\(\)/);
   assert.throws(() => io.toUser('u1'), /listen\(\)/);
+  // Phase 1D targeting/queries also require a running server.
+  assert.throws(() => io.metrics(), /listen\(\)/);
+  assert.throws(() => io.presence('lobby'), /listen\(\)/);
   // authorize() is chainable and registered before listen() (Phase 1C).
   assert.equal(
     io.authorize(() => ({ accept: true })),
     io,
     'authorize() should be chainable',
   );
-  // …while future phases still point at their phase.
-  assert.throws(() => io.metrics(), /Phase 1D/);
 });

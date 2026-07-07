@@ -68,7 +68,7 @@ proptest! {
 
         // Pool of 8 connections; disconnected slots stay dead (stale ops no-op).
         let mut ids: Vec<Option<ConnectionId>> = (0..8)
-            .map(|_| Some(conns.insert(mk_handle(&metrics, 1024, BackpressurePolicy::DropNewest))))
+            .map(|_| Some(conns.insert(mk_handle(&metrics, 1024, BackpressurePolicy::DropNewest), None)))
             .collect();
 
         for op in &ops {
@@ -146,10 +146,22 @@ async fn fanout_exactly_once_except_honored_nonmembers_nothing() {
     let conns = Registry::new();
     let rooms = RoomRegistry::new();
 
-    let a = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest));
-    let b = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest));
-    let c = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest));
-    let outsider = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest));
+    let a = conns.insert(
+        mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest),
+        None,
+    );
+    let b = conns.insert(
+        mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest),
+        None,
+    );
+    let c = conns.insert(
+        mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest),
+        None,
+    );
+    let outsider = conns.insert(
+        mk_handle(&metrics, 1 << 20, BackpressurePolicy::DropNewest),
+        None,
+    );
 
     let identity = IdentityRegistry::new();
     for id in [a, b, c] {
@@ -201,9 +213,18 @@ async fn slow_member_hits_policy_alone() {
     let conns = Registry::new();
     let rooms = RoomRegistry::new();
 
-    let healthy1 = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::Disconnect));
-    let slow = conns.insert(mk_handle(&metrics, 64, BackpressurePolicy::Disconnect));
-    let healthy2 = conns.insert(mk_handle(&metrics, 1 << 20, BackpressurePolicy::Disconnect));
+    let healthy1 = conns.insert(
+        mk_handle(&metrics, 1 << 20, BackpressurePolicy::Disconnect),
+        None,
+    );
+    let slow = conns.insert(
+        mk_handle(&metrics, 64, BackpressurePolicy::Disconnect),
+        None,
+    );
+    let healthy2 = conns.insert(
+        mk_handle(&metrics, 1 << 20, BackpressurePolicy::Disconnect),
+        None,
+    );
 
     let identity = IdentityRegistry::new();
     for id in [healthy1, slow, healthy2] {

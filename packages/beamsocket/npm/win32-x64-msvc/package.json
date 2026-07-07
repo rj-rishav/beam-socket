@@ -1,0 +1,11 @@
+{
+  "name": "beamsocket-win32-x64-msvc",
+  "version": "0.1.0-alpha.0",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "beamsocket.win32-x64-msvc.node",
+  "files": ["beamsocket.win32-x64-msvc.node"],
+  "description": "Prebuilt beamsocket native addon for win32-x64.",
+  "license": "MIT",
+  "engines": { "node": ">= 18" }
+}

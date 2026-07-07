@@ -1,0 +1,12 @@
+{
+  "name": "beamsocket-linux-x64-musl",
+  "version": "0.1.0-alpha.0",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["musl"],
+  "main": "beamsocket.linux-x64-musl.node",
+  "files": ["beamsocket.linux-x64-musl.node"],
+  "description": "Prebuilt beamsocket native addon for linux-x64-musl.",
+  "license": "MIT",
+  "engines": { "node": ">= 18" }
+}

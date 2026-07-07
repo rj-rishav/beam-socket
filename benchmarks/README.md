@@ -84,6 +84,32 @@ signal until the pinned-box run isolates client and server hardware.
 3. Socket.IO at 25k+.
 4. Echo-latency suite (p99 at 10k conns, <5 ms target) — not yet written.
 
+## Memory budget per idle connection (Phase 1D — 1B review debt)
+
+Decomposition of the measured **~11.6 KB/conn** idle baseline (Node 20, 10k
+idle, no app `message` subscription). "Measured" rows are from a run; "struct."
+rows are computed from the types (with the allocator's real footprint folded in
+where a measured row covers them). *Recoverable* = we could shrink it without a
+protocol change; *structural* = inherent to holding a live socket here.
+
+| Component | ~bytes/conn | Source | Structural vs recoverable |
+|---|---|---|---|
+| Kernel socket buffers (TCP rmem/wmem, low-watermark) | ~4–5 KB | struct. (OS) | **Structural** to a TCP socket. Recoverable only via OS tuning (`net.ipv4.tcp_rmem/wmem`), not by us; the dominant single line. |
+| Codec read buffer (tungstenite `READ_BUFFER_SIZE`) | 4096 | struct. (constant) | **Recoverable.** Already cut 128 KB→4 KB in 1B; could go lazier (allocate on first frame) or smaller-initial-grow-on-demand. A concrete 1.x lever. |
+| Engine bookkeeping: registry entry + `ConnHandle` (mailbox `Arc`, control `mpsc(4)`, close `watch`) | ~2.5 KB | **measured** (`engine_bookkeeping_memory_cost`, minus identity) | **Partly recoverable.** Dominated by the two always-allocated per-connection channels (control + close); a lazier "allocate the control path on first server-initiated action" design could reclaim most of it. |
+| Tokio per-connection task (future state, scheduler slot) | ~0.3–0.6 KB | struct. | **Structural** to the isolated-task model (the BEAM-style crash boundary). Task stacks are lazy; only the future's captured state counts. |
+| Identity index entry (authenticated only) | **~20 B** amortized (multi-device) · ~278 B worst case (all singletons) | **measured** (1C `identity_memory_cost_measurement`) | **Structural**, and tiny; absent entirely for anonymous connections. |
+| JS `Socket` proxy (only if the app subscribes to `connection`) | ~0.2–0.5 KB | struct. | **Recoverable** — already created only on demand; a fully proxy-free path is possible for pure-fan-out apps that never touch a socket object. |
+
+Reading it: the two biggest levers we own are the **codec read buffer** (4 KB,
+recoverable) and the **per-connection control/close channels** (~part of the
+2.5 KB, recoverable via lazy allocation). Kernel buffers dominate and are the
+OS's, not ours — which is why uWebSockets.js (C++, <1 KB/conn) stays ~13× denser
+until those levers are pulled. The `identity`/presence additions cost ~0 here
+(~20 B amortized; presence adds no per-connection state — it reads the entry
+that already exists). Numbers reproduce via `--ignored` measurement tests in
+`crates/core/tests/phase1d.rs` and the density benchmark below.
+
 ## Running
 
 ```bash

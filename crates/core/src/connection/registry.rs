@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use slab::Slab;
 
 use crate::connection::ConnHandle;
-use crate::ids::{ConnectionId, RoomId, GENERATION_MASK};
+use crate::ids::{ConnectionId, RoomId, UserId, GENERATION_MASK};
 
 /// Power of two; shard = round-robin insert counter & (SHARDS-1).
 pub const SHARDS: usize = 16;
@@ -41,6 +41,10 @@ struct Entry {
     /// by the shard mutex, which serializes ALL membership changes for this
     /// connection — see rooms.rs for the lock-order invariant.
     rooms: HashSet<RoomId>,
+    /// The user this connection was bound to at authorize-accept, or `None`
+    /// for an anonymous connection (Phase 1D — backs `io.presence(room).list()`,
+    /// which needs conn→userId; the sharded user index is user→conns).
+    user: Option<UserId>,
 }
 
 pub struct Registry {
@@ -71,7 +75,7 @@ impl Registry {
         }
     }
 
-    pub fn insert(&self, handle: ConnHandle) -> ConnectionId {
+    pub fn insert(&self, handle: ConnHandle, user: Option<UserId>) -> ConnectionId {
         let shard_idx = self.next.fetch_add(1, Ordering::Relaxed) & (SHARDS - 1);
         let mut shard = self.shards[shard_idx].lock().unwrap();
         let entry = shard.slab.vacant_entry();
@@ -80,6 +84,7 @@ impl Registry {
             generation: 0, // fixed up below once we know the slot's generation
             handle,
             rooms: HashSet::new(),
+            user,
         });
         let generation = if key < shard.gens.len() {
             // Recycled slot: bump so stale IDs miss.
@@ -135,6 +140,15 @@ impl Registry {
         Some(f(&mut entry.rooms))
     }
 
+    /// The user bound to a live connection (Phase 1D presence). `Some(inner)` =
+    /// the connection is live (`inner` is its userId, or `None` if anonymous);
+    /// the OUTER `None` = the id is stale/gone, so presence skips it.
+    pub fn user_of(&self, id: ConnectionId) -> Option<Option<UserId>> {
+        let shard = self.shards.get(id.shard() as usize)?.lock().unwrap();
+        let entry = shard.slab.get(id.key() as usize)?;
+        (entry.generation == id.generation()).then(|| entry.user.clone())
+    }
+
     pub fn len(&self) -> usize {
         self.shards
             .iter()
@@ -186,7 +200,7 @@ mod tests {
     #[test]
     fn insert_get_remove() {
         let r = Registry::new();
-        let id = r.insert(handle());
+        let id = r.insert(handle(), None);
         assert!(r.get(id).is_some());
         assert_eq!(r.len(), 1);
         assert!(r.remove(id).is_some());
@@ -199,13 +213,13 @@ mod tests {
     fn recycled_slot_bumps_generation_and_stale_id_misses() {
         let r = Registry::new();
         // Fill one full round-robin cycle so the next insert reuses shard 0.
-        let first = r.insert(handle());
+        let first = r.insert(handle(), None);
         for _ in 0..SHARDS - 1 {
-            let id = r.insert(handle());
+            let id = r.insert(handle(), None);
             r.remove(id);
         }
         r.remove(first);
-        let recycled = r.insert(handle()); // same shard 0, same slab key 0
+        let recycled = r.insert(handle(), None); // same shard 0, same slab key 0
         assert_eq!(recycled.shard(), first.shard());
         assert_eq!(recycled.key(), first.key());
         assert_ne!(recycled.generation(), first.generation());
@@ -224,7 +238,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut ids = Vec::new();
                     for i in 0..500 {
-                        let id = r.insert(handle());
+                        let id = r.insert(handle(), None);
                         assert!(r.get(id).is_some());
                         ids.push(id);
                         if i % 3 == 0 {

@@ -1,0 +1,80 @@
+# Phase 1D: napi-rs prebuild matrix for the top 6 targets. Builds the native
+# addon per platform, uploads each as an artifact, and (only on a version tag)
+# publishes the per-platform packages + the main package. WRITTEN AND VALIDATED
+# in Phase 1D; the actual publish is a release-time act (needs NPM_TOKEN and a
+# tag), NOT part of this PR.
+name: prebuild
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # cross-linkers for the targets that need them (arm64 / musl on ubuntu).
+      - name: Install cross toolchain (linux arm64/musl)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu || true
+      - run: npm ci --workspaces --include-workspace-root
+      - name: Build addon
+        run: cargo build -p beamsocket-node --release --features napi --target ${{ matrix.target }}
+      # Copy the built library into the matching npm/<triple>/ package dir under
+      # its napi filename (copy-native resolves the extension per-OS).
+      - name: Stage prebuilt binary
+        shell: bash
+        run: node packages/beamsocket/scripts/stage-prebuild.mjs ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.target }}
+          path: packages/beamsocket/npm/*/beamsocket.*.node
+          if-no-files-found: error
+
+  publish:
+    name: publish (tag only)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, registry-url: 'https://registry.npmjs.org' }
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Collect prebuilt binaries into npm/ dirs
+        run: node packages/beamsocket/scripts/collect-prebuilds.mjs artifacts
+      - run: npm ci --workspaces --include-workspace-root
+      - run: npm run build -w beamsocket
+      # Publish each per-platform package, then the main package. --provenance
+      # and NPM_TOKEN are supplied at release time.
+      - name: Publish per-platform packages + main
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in packages/beamsocket/npm/*/; do
+            npm publish "$dir" --access public --tag alpha || exit 1
+          done
+          npm publish packages/beamsocket --access public --tag alpha
