@@ -1,7 +1,9 @@
 # RFC 0002 — HTTP Server Attach
 
-**Status:** Proposed — submitted for architect review (NOT frozen; freezing
-happens after review)
+**Status:** FROZEN — accepted; the spec for the Phase 1.1 implementation
+(`phase-1.1-attach`). Two review riders folded in on acceptance: (1) §8.1 gains
+the stranded-bytes drain step; (2) §14's macOS row requires CI proof before any
+release doc claims macOS support.
 **Phase:** 1.1 — Attach to an Existing HTTP Server (ENGINEERING.md §9)
 **Depends on:** Phase 1D runtime (`phase-1d-runtime`) — the connection lifecycle,
 the admission `Gate`, `authorize`, and the graceful `close()` drain this RFC
@@ -196,10 +198,14 @@ Unix. This is a genuinely different mechanism with its own correctness proof.
 **documented standalone-port fallback** (design C's fallback leg): run BeamSocket
 on its own port via `listen()` alongside the Express app, behind the same LB /
 reverse proxy. This preserves Rule 1 (the engine owns its own sockets) and every
-feature, at the cost of a second port. `{ server }` on Windows throws with a
-pointer to the fallback. Windows fd handoff (via `WSADuplicateSocket`) is a
-named follow-up, gated on its own spike. An honest "not yet" beats a broken
-"yes."
+feature, at the cost of a second port. `{ server }` on Windows throws (verbatim):
+
+> `BeamSocket cannot attach to an HTTP server on Windows yet (fd handoff needs
+> WSADuplicateSocket, not shipped in 1.1). Run BeamSocket on its own port with
+> listen() alongside your HTTP server, behind the same load balancer.`
+
+Windows fd handoff (via `WSADuplicateSocket`) is a named follow-up, gated on its
+own spike. An honest "not yet" beats a broken "yes."
 
 ## 8. Hard problem 3 — head-byte replay (+ the detach sequence)
 
@@ -211,6 +217,13 @@ failure mode:
 1. **`socket.pause()`** BEFORE reading the fd — stop libuv from reading more
    bytes into Node (which would strand them where Rust can't reach). Register no
    `'data'` handler.
+1a. **(Rider 1) Drain already-buffered bytes into `head`.** `socket.pause()`
+   stops *future* libuv reads, but bytes libuv **already** delivered into the
+   socket's readable buffer past the request are neither in `head` nor on the
+   wire — they would be stranded. So, after pausing, synchronously pull them:
+   `for (let c; (c = socket.read()) !== null; ) head = Buffer.concat([head, c])`.
+   The combined `head` is what `attach()` replays (§8.3). Named test:
+   `attach_drains_stranded_prepause_bytes` (§8.4).
 2. **Read `fd = socket._handle.fd`** (Unix). This is a private field; §10 covers
    the stability risk and detection.
 3. **`attach(fd, …)` → Rust `dup(fd)`** — Rust now holds an **independent** fd
@@ -268,6 +281,10 @@ implementation PR.
 - **`attach_empty_head_normal_first_frame`** — the common case (`head.length ===
   0`, first frame arrives after) still echoes — proves the prefix adapter is a
   no-op when empty.
+- **`attach_drains_stranded_prepause_bytes`** (Rider 1) — bytes buffered by
+  libuv past the request but NOT in `head` are drained via `socket.read()`
+  (§8.1 step 1a) and echoed; asserts the pre-pause drain closes the gap the raw
+  `head` leaves.
 
 ## 9. Hard problem 4 — error-path fd hygiene (RAII, mirroring 1C)
 
@@ -460,7 +477,7 @@ mechanic is validated, not assumed.
 | Platform | Plaintext `http.Server` attach | `https.Server` attach | Fallback when unsupported |
 |---|---|---|---|
 | **Linux** | ✅ **fd handoff (design A)** — spike-proven (§12) | ❌ throw (§6) | standalone `listen()` port |
-| **macOS** | ✅ fd handoff (same POSIX path; expected, not run) | ❌ throw (§6) | standalone `listen()` port |
+| **macOS** | ✅ fd handoff (same POSIX path) — **(Rider 2) CI-proven required before any release doc claims macOS support** | ❌ throw (§6) | standalone `listen()` port |
 | **Windows** | ❌ throw (§7) — fd handoff deferred (`WSADuplicateSocket`) | ❌ throw (§6/§7) | standalone `listen()` port |
 
 The single blessed TLS topology for all platforms: **terminate TLS at the LB /
