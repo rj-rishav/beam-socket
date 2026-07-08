@@ -37,16 +37,20 @@ Every PR is reviewed against these five rules. They come from ARCHITECTURE.md §
 
 ## 3. Roadmap at a glance
 
-| Phase | Deliverable | Exit gate |
-|---|---|---|
-| **0** | Event bridge spike | `docs/rfcs/0001-results.md` written; one design passes RFC gates |
-| **1A** | Echo server, end-to-end | Autobahn passes; JS client echoes through the real bridge |
-| **1B** | Rooms + broadcast | Fan-out benchmark vs ws/uWS published |
-| **1C** | Identity + admission limits | Multi-device `toUser` works; spoofed XFF test passes |
-| **1D** | Presence, metrics, graceful close | 10-min soak clean → publish `0.1.0-alpha` |
-| **1.1** | Attach to existing HTTP server | RFC 0002 written first, then Express/Fastify example |
+| Phase | Deliverable | Exit gate | Status |
+|---|---|---|---|
+| **0** | Event bridge spike | `docs/rfcs/0001-results.md` written; one design passes RFC gates | ✅ merged |
+| **1A** | Echo server, end-to-end | Autobahn passes; JS client echoes through the real bridge | ✅ merged |
+| **1B** | Rooms + broadcast | Fan-out benchmark vs ws/uWS published | ✅ merged (benchmark provisional → pinned box) |
+| **1C** | Identity + admission limits | Multi-device `toUser` works; spoofed XFF test passes | ✅ merged |
+| **1D** | Presence, metrics, graceful close | 10-min soak clean → publish `0.1.0-alpha` | ✅ merged (publish rides the release blockers) |
+| **1.1** | Attach to existing HTTP server | RFC 0002 written first, then Express/Fastify example | ✅ merged (macOS row CI-gated) |
+| **2A** | Observability read surface | §12 gates: stats/topRooms/backpressureReport + zero-hot-path-cost proof | current |
+| **2B** | Admin actions | §12 gates: disconnect verbs + identity/room cleanup proofs | after 2A |
 
 Phases are strictly sequential. **Do not start a phase while the previous phase's exit gate is open.**
+
+**Release blockers** (external hardware/credentials; tracked in README): pinned-box constant re-confirmation, pinned-box benchmarks, 10-minute soak, npm publish + install matrix, darwin CI attach run. **Parked backlog** (after Phase 2): RFC 0003 engine-side TLS; Windows fd-handoff spike.
 
 ---
 
@@ -260,3 +264,75 @@ Housekeeping allowed at phase start (pre-approved, separate commit): fix the two
 - [ ] New queue/channel → bounded, with an overflow policy and a metric (Rule 5)
 - [ ] Uses client IP or headers → tested behind a simulated proxy (Rule 3)
 - [ ] Tests listed in this doc for the phase are green
+
+---
+
+## 12. Phase 2 — Runtime Maturity (observability + admin)
+
+*(Appended after §10–§11 so merged PR references to those sections stay
+stable. Phase 2 splits into 2A and 2B, one PR each.)*
+
+**Goal:** answer "what is my runtime doing right now?" without an APM vendor,
+and give operators the levers the runtime already implies. Vision reference:
+`io.stats()`, `io.topRooms()`, `io.connectionCount()`, `io.memoryUsage()`,
+`io.backpressureReport()`.
+
+### The Phase 2 rule: diagnostics must be free when unused and bounded when used
+
+1. **Zero hot-path cost.** No new per-message work, ever (Rule 1 applies to
+   metrics too). Rates are derived by a 1 Hz sampler task in Rust reading the
+   *existing* counters — never by instrumenting the message path.
+2. **Bounded output.** Every query returns top-N with a hard cap (default 10,
+   max 100). Nothing ever serializes 500k connections across the bridge. A
+   diagnostic that can dump the world is an outage waiting for a keystroke.
+3. **Copy-out discipline.** Registry/room iteration follows the 1B pattern —
+   per-shard copy-out, merge, release; never hold a shard lock while touching
+   another shard or the bridge.
+
+### 12.1 Phase 2A — Observability read surface
+
+| API | Source | Cost note (Rule 4) |
+|---|---|---|
+| `io.stats()` | uptime + existing counters + 1 Hz EWMA rates (msgs/s, bytes/s in/out) | sampler: one task, ~0 B/conn |
+| `io.topRooms(n)` | per-shard partial top-N merge by member count + msgs/s | +8 B/room (one message counter/room) — stated |
+| `io.connectionCount()` | registry len | free |
+| `io.memoryUsage()` | structural model (1D memory table) × live counts + measured mailbox bytes-in-flight | estimates labeled as estimates |
+| `io.backpressureReport({topN})` | worst mailboxes: depth, HWM %, drops, socketId, userId | reads existing per-conn gauges, no new state |
+| `io.user(id).connections()` | identity index (the 1C promise) | free |
+| `io.room(id).info()` | member count, msg counter | free |
+| `io.metricsText()` | Prometheus text exposition of `metrics()` (ARCHITECTURE §2.1 promise) | free |
+
+**Required tests:** rates move under load and decay to zero after; `topRooms`
+agrees with a reference model under proptest churn; `backpressureReport`
+surfaces a deliberately-slowed consumer as the top offender; every query
+enforces its cap (ask for 1e9, get 100); `user().connections()` matches the
+multi-device tests; **perf regression guard:** echo throughput/p99 on the 1D
+baseline unchanged within noise with the sampler running (the zero-hot-path
+proof).
+
+**DoD:** every 2A field named in `types.ts`; sampler interval configurable and
+documented; PR notes in the 1.1 format.
+
+### 12.2 Phase 2B — Admin actions
+
+| API | Semantics |
+|---|---|
+| `io.disconnectSocket(id, code?)` | close one connection (default 1000), full 1C/1D cleanup path |
+| `io.disconnectUser(userId, code?)` | close every device; identity entry gone after (the 1C promise) |
+| `io.closeRoom(room, code?)` | disconnect-free: `leave` all members, destroy the room |
+
+All three are Rust-side sweeps (one FFI call), reusing the disconnect/cleanup
+paths the phases already proved; **no new teardown logic** — if an admin verb
+needs new cleanup code, that's a smell that the existing path leaks.
+
+**Required tests:** disconnectUser drops all devices and empties the identity
+entry; closeRoom leaves connections alive but the room gone (bidirectional
+views agree — extend the 1B proptest); admin verbs during `close()` drain are
+safe no-ops; each verb's close code lands on the client.
+
+**DoD:** verbs in types.ts with their codes; Rule 4: zero new per-conn state;
+PR notes honest.
+
+### Explicitly NOT Phase 2
+Clustering (Phase 3), distributed presence (Phase 4), new transports
+(Phase 5), engine TLS (RFC 0003), Windows attach — parked, by name.
