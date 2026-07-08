@@ -1,0 +1,16 @@
+{
+  "name": "beamsocket-example-express-attach",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 1.1 — BeamSocket attached to an Express server on one port (RFC 0002).",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.0"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -41,6 +41,21 @@ function reqKey(hi: number, lo: number): string {
   return `${hi}:${lo}`;
 }
 
+/** Verbatim throw messages (RFC 0002 §6/§7/§10.1) — tests assert these exactly. */
+const HTTPS_ATTACH_MSG =
+  'BeamSocket cannot attach to an https.Server (Node owns the decrypted stream; the raw fd is ciphertext). Terminate TLS at your load balancer and attach to a plaintext http.Server, or run BeamSocket on its own TLS port (engine-side TLS is RFC 0003).';
+const WINDOWS_ATTACH_MSG =
+  'BeamSocket cannot attach to an HTTP server on Windows yet (fd handoff needs WSADuplicateSocket, not shipped in 1.1). Run BeamSocket on its own port with listen() alongside your HTTP server, behind the same load balancer.';
+const LISTEN_MUTEX_MSG =
+  'listen() is invalid when constructed with { server } — the HTTP server owns the port';
+
+/** The request path without query (for `path` claim routing). */
+function pathnameOf(url: string | undefined): string {
+  const u = url ?? '/';
+  const q = u.indexOf('?');
+  return q < 0 ? u : u.slice(0, q);
+}
+
 function toNativeConfig(config: BeamSocketConfig): NativeConfig {
   // Map trustProxy `false | true | string[]` onto the native mode+cidrs pair.
   const tp = config.trustProxy;
@@ -86,10 +101,30 @@ export class BeamSocket extends EventEmitter {
    * FIFO-bounded (evict-oldest); see BoundedMetaMap / PENDING_AUTH_CAP.
    */
   #pendingAuth = new BoundedMetaMap<PendingAuth>(PENDING_AUTH_CAP);
+  // ── Phase 1.1 attach (RFC 0002) ──
+  #server?: BeamSocketConfig['server'];
+  #path?: string;
+  #upgradeHandler?: (req: any, socket: any, head: Buffer) => void;
+  #closing = false;
 
   constructor(config: BeamSocketConfig = {}) {
     super();
     this.#config = config;
+    if (config.server) {
+      // §6: https.Server hands us ciphertext — refuse loudly (verbatim message).
+      if (typeof (config.server as any).setSecureContext === 'function') {
+        throw new Error(HTTPS_ATTACH_MSG);
+      }
+      // §7: Windows fd handoff is deferred — refuse loudly (verbatim message).
+      if (process.platform === 'win32') {
+        throw new Error(WINDOWS_ATTACH_MSG);
+      }
+      this.#server = config.server;
+      this.#path = config.path;
+      this.#upgradeHandler = (req, socket, head) => this.#onUpgrade(req, socket, head);
+      // Register now; the engine starts lazily on the first claimed upgrade.
+      this.#server.on('upgrade', this.#upgradeHandler);
+    }
   }
 
   /**
@@ -174,18 +209,88 @@ export class BeamSocket extends EventEmitter {
    * port is bound.
    */
   async listen(port: number): Promise<number> {
+    if (this.#server) {
+      throw new Error(LISTEN_MUTEX_MSG); // §10.1 — attached mode owns no port
+    }
     if (this.#listening) {
       throw new Error('listen() may only be called once per BeamSocket (Phase 1A)');
     }
-    const native = loadNative();
-    this.#engine = native.BeamEngine.start(
-      toNativeConfig(this.#config),
-      this.#authorizeFn !== undefined,
-      (batch) => this.#onFlush(batch),
-    );
-    const bound = this.#engine.listen(port);
+    const engine = this.#ensureStarted();
+    const bound = engine.listen(port);
     this.#listening = true;
     return bound;
+  }
+
+  /** Boot the Rust engine + bridge exactly once (shared by listen() + attach). */
+  #ensureStarted(): NativeEngine {
+    if (!this.#engine) {
+      const native = loadNative();
+      this.#engine = native.BeamEngine.start(
+        toNativeConfig(this.#config),
+        this.#authorizeFn !== undefined,
+        (batch) => this.#onFlush(batch),
+      );
+    }
+    return this.#engine;
+  }
+
+  /**
+   * `'upgrade'` handler for attached mode (RFC 0002 §8.1, §10.2). Claims only
+   * matching-path upgrades; defers non-matches to other listeners (never
+   * destroys them). Sole-handler mode (no `path`) 400s malformed upgrades. On a
+   * claim: pause, drain stranded pre-pause bytes into `head` (Rider 1), hand the
+   * fd to Rust, then detach the Node socket.
+   */
+  #onUpgrade(req: any, socket: any, head: Buffer): void {
+    // §10.2 path routing: only claim our path; defer the rest.
+    if (this.#path !== undefined && pathnameOf(req.url) !== this.#path) {
+      return;
+    }
+    // §10.4: 503 an upgrade that raced close()'s listener removal.
+    if (this.#closing) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // Must be a WebSocket upgrade.
+    const isWs =
+      String(req.headers?.upgrade ?? '').toLowerCase() === 'websocket' &&
+      typeof req.headers?.['sec-websocket-key'] === 'string';
+    if (!isWs) {
+      // Sole-handler mode → we own all upgrades, so reject malformed ones (400).
+      // Path mode → not ours to reject; defer.
+      if (this.#path === undefined) {
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+      }
+      return;
+    }
+
+    const engine = this.#ensureStarted();
+
+    // §8.1 step 1 + Rider 1: pause, then drain bytes libuv already buffered past
+    // the request into `head` — otherwise a coalesced first frame is stranded.
+    socket.pause();
+    let full = head;
+    for (let chunk = socket.read(); chunk !== null; chunk = socket.read()) {
+      full = Buffer.concat([full, chunk]);
+    }
+
+    // §8.1 step 2: read the fd (private field; absence → 500 + detach).
+    const fd = typeof socket._handle?.fd === 'number' ? socket._handle.fd : -1;
+    if (fd < 0) {
+      socket.write('HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // rawHeaders is the flat [name, value, …] list (Rust lowercases the names).
+    // Accept vs reject are both handled Rust-side (dup kept alive / status
+    // written); the SDK's job is identical either way — detach the Node socket.
+    engine.attach(fd, socket.remoteAddress ?? '', req.method ?? 'GET', req.url ?? '/', req.rawHeaders ?? [], full);
+
+    // §8.1 step 4: detach. After this, Node holds zero per-connection state.
+    socket.destroy();
   }
 
   /**
@@ -195,6 +300,14 @@ export class BeamSocket extends EventEmitter {
    * the runtime is down — after which the Node process can exit on its own.
    */
   async close(opts: CloseOptions = {}): Promise<void> {
+    // Attached mode (§10.4): `#closing` makes #onUpgrade answer 503 to any
+    // matching-path upgrade from now on — the handler STAYS registered so a
+    // racing upgrade gets a real 503 whether it dispatches during or after the
+    // drain (removing the handler would route matching upgrades to the app's
+    // request handler or hang them, never a 503). The server is shutting down,
+    // so a lingering 503-only listener is harmless. Non-matching paths are still
+    // deferred to other listeners.
+    this.#closing = true;
     const engine = this.#engine;
     if (!engine) return;
     // Prevent re-entrancy and drop references so nothing races the drain.

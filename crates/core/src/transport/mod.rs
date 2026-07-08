@@ -133,6 +133,22 @@ pub trait Transport: Send + Sync + 'static {
         config: &Config,
         gate: &Gate,
     ) -> impl Future<Output = Result<Accepted<Self::Sink, Self::Source>, AcceptError>> + Send;
+
+    /// **Attach path (Phase 1.1, RFC 0002 §5/§8.3).** The second producer into
+    /// the connection lifecycle: the HTTP request was already parsed by Node
+    /// (there is nothing left to read for the handshake), and the admission
+    /// `Gate` has already run in `engine.attach` — so this only COMPLETES the
+    /// WebSocket 101 (`Sec-WebSocket-Accept` from the pre-parsed `ws_key`) and
+    /// starts framing over a stream that REPLAYS `head` before the wire, so a
+    /// first frame coalesced with the upgrade is not lost. Returns the same
+    /// split frame halves `accept` does, so downstream (`run_admitted`) is
+    /// byte-for-byte shared.
+    fn adopt(
+        io: TcpStream,
+        ws_key: &str,
+        head: Bytes,
+        config: &Config,
+    ) -> impl Future<Output = Result<(Self::Sink, Self::Source), TransportError>> + Send;
 }
 
 pub mod websocket;

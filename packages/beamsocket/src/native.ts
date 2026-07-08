@@ -106,6 +106,24 @@ export interface NativeEngine {
   broadcastTextUser(userId: string, data: string, except: Uint32Array): NativeFanout;
   // Phase 1D — presence. One FFI call returns the room's (id, userId) pairs.
   presenceList(room: string): NativePresenceEntry[];
+  // Phase 1.1 — HTTP attach (Unix only; the SDK throws on Windows before here).
+  // `headersFlat` is [k0,v0,k1,v1,…] (e.g. req.rawHeaders).
+  attach(
+    fd: number,
+    remoteAddr: string,
+    method: string,
+    url: string,
+    headersFlat: string[],
+    head: Buffer,
+  ): NativeAttachResult;
+}
+
+/** Result of a native attach (Phase 1.1). */
+export interface NativeAttachResult {
+  /** true → handoff in progress (Rust owns the connection). */
+  accepted: boolean;
+  /** HTTP status Rust wrote to the fd on reject (0 when accepted). */
+  status: number;
 }
 
 export interface NativeModule {

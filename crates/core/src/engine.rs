@@ -22,11 +22,14 @@ use crate::connection::{
 use crate::events::{EngineEvent, EventSender};
 use crate::identity::{AuthorizeOutcome, AuthorizeResolution, Authorizer, IdentityRegistry};
 use crate::ids::{ConnectionId, RoomId, UserId};
-use crate::limits::{ClientIpResolver, Gate, IpLimiter};
+use crate::limits::{
+    header_value, AdmittedUpgrade, ClientIpResolver, Gate, IpLimiter, HTTP_SERVICE_UNAVAILABLE,
+    HTTP_TOO_MANY_REQUESTS,
+};
 use crate::metrics::Metrics;
 use crate::presence::{LocalPresence, PresenceEntry, PresenceStore};
 use crate::rooms::{MembershipChange, RoomRegistry};
-use crate::transport::{Accepted, FrameSink, OutFrame, Transport, WebSocketTransport};
+use crate::transport::{Accepted, FrameSink, FrameSource, OutFrame, Transport, WebSocketTransport};
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -63,6 +66,31 @@ pub enum SendStatus {
     Backpressure,
     /// Unknown/stale connection ID.
     NotFound,
+}
+
+/// A Node-parsed HTTP upgrade request handed to `engine.attach` (Phase 1.1,
+/// RFC 0002 §5). The handshake was already read by Node, so the engine receives
+/// the parsed pieces rather than reading them off the wire.
+#[derive(Debug, Clone)]
+pub struct ParsedUpgrade {
+    pub method: String,
+    /// Request target (path+query) — used for `path` routing + `AuthorizeRequest.url`.
+    pub url: String,
+    /// Request headers, names lowercased (the SDK lowercases before crossing).
+    pub headers: Vec<(String, String)>,
+}
+
+/// Result of `engine.attach` (RFC 0002 §4). On `Rejected`, the engine has
+/// already written the HTTP error status to the dup'd fd and will close it; the
+/// SDK just detaches the Node socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachOutcome {
+    /// Admitted — the handoff is proceeding on the engine runtime (authorize,
+    /// then the normal 1A–1D lifecycle).
+    Accepted,
+    /// Rejected before the 101 with this HTTP status (429 per-IP, 503 draining,
+    /// 500 adoption failure). The engine owns writing it + closing.
+    Rejected(u16),
 }
 
 pub struct Engine {
@@ -182,15 +210,10 @@ impl Engine {
             .local_addr()
             .map_err(|e| EngineError::Io(e.to_string()))?
             .port();
-        let ctx = Arc::new(ConnCtx {
-            config: self.config.clone(),
-            metrics: self.metrics.clone(),
-            events: self.events.clone(),
-        });
         let shutdown_rx = self.shutdown_tx.subscribe();
         handle.spawn(accept_loop::<WebSocketTransport>(
             listener,
-            ctx,
+            self.conn_ctx(),
             self.registry.clone(),
             self.rooms.clone(),
             self.identity.clone(),
@@ -200,6 +223,66 @@ impl Engine {
         ));
         *listening = true;
         Ok(actual)
+    }
+
+    /// The per-connection shared context (config, metrics, events). Shared by
+    /// the own-port accept loop and the Phase 1.1 attach path.
+    fn conn_ctx(&self) -> Arc<ConnCtx> {
+        Arc::new(ConnCtx {
+            config: self.config.clone(),
+            metrics: self.metrics.clone(),
+            events: self.events.clone(),
+        })
+    }
+
+    /// **Attach path (Phase 1.1, RFC 0002 §4/§5).** Adopt a Node-owned socket
+    /// (already dup'd into `std_stream` by the binding) whose HTTP upgrade Node
+    /// already parsed. Runs the SAME admission `Gate` as own-port SYNCHRONOUSLY
+    /// (so the caller learns Accepted/Rejected(status) immediately), then, on
+    /// admit, spawns the 101 + head replay + authorize + normal lifecycle on the
+    /// engine runtime. Called from the Node thread; enters the runtime context
+    /// to register the socket with the reactor.
+    pub fn attach(
+        &self,
+        std_stream: std::net::TcpStream,
+        peer: IpAddr,
+        parsed: ParsedUpgrade,
+        head: bytes::Bytes,
+    ) -> AttachOutcome {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return AttachOutcome::Rejected(HTTP_SERVICE_UNAVAILABLE); // engine down
+        };
+        let handle = runtime.handle().clone();
+        let _enter = handle.enter(); // TcpStream::from_std needs the reactor in TLS
+        let stream = match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(_) => return AttachOutcome::Rejected(500),
+        };
+
+        // Same admission gate as own-port, but run here (not in a handshake
+        // callback) so the synchronous return carries the reject status.
+        match self.gate.admit(peer, parsed.headers, parsed.url) {
+            Err(status) => {
+                handle.spawn(write_http_error_and_close(stream, status));
+                AttachOutcome::Rejected(status)
+            }
+            Ok(admitted) => {
+                let ws_key =
+                    header_value(&admitted.headers, "sec-websocket-key").unwrap_or_default();
+                handle.spawn(setup_attached(
+                    stream,
+                    ws_key,
+                    head,
+                    admitted,
+                    self.conn_ctx(),
+                    self.registry.clone(),
+                    self.rooms.clone(),
+                    self.identity.clone(),
+                    self.authorizer.clone(),
+                ));
+                AttachOutcome::Accepted
+            }
+        }
     }
 
     // ── Phase 1B: rooms + broadcast (fan-out entirely in Rust, Rule 1) ──
@@ -479,14 +562,31 @@ async fn setup_connection<T: Transport>(
     // 429 before any WebSocket exists. A rejected/failed handshake never
     // reaches JS — the socket just goes away (the per-IP slot, if reserved, is
     // released inside `accept`).
-    let Ok(Accepted {
+    if let Ok(accepted) = T::accept(tcp, peer, &ctx.config, &gate).await {
+        run_admitted(accepted, ctx, registry, rooms, identity, authorizer).await;
+    }
+}
+
+/// The shared post-admission tail — authorize, insert, bind identity, run the
+/// connection, clean up. Both producers converge here: `accept` (own-port) and
+/// `adopt` (attach, RFC 0002 §5). Generic over the frame halves; both paths hand
+/// in `WsSink`/`WsSource`.
+async fn run_admitted<Snk, Src>(
+    accepted: Accepted<Snk, Src>,
+    ctx: Arc<ConnCtx>,
+    registry: Arc<Registry>,
+    rooms: Arc<RoomRegistry>,
+    identity: Arc<IdentityRegistry>,
+    authorizer: Option<Arc<Authorizer>>,
+) where
+    Snk: FrameSink,
+    Src: FrameSource,
+{
+    let Accepted {
         sink,
         source,
         upgrade,
-    }) = T::accept(tcp, peer, &ctx.config, &gate).await
-    else {
-        return;
-    };
+    } = accepted;
     // Hold the per-IP admission slot for the whole connection lifetime: dropping
     // this guard (on ANY return below) releases it, so a churn of
     // connect/disconnect leaves the per-IP table empty (leak test).
@@ -570,4 +670,55 @@ async fn reject_after_upgrade<Snk: FrameSink>(mut sink: Snk, code: u16, reason: 
         })
         .await;
     sink.shutdown().await;
+}
+
+/// Attach tail (RFC 0002 §5): complete the 101 + head replay via `adopt`, then
+/// converge on the shared `run_admitted`. Runs on the engine runtime.
+#[allow(clippy::too_many_arguments)]
+async fn setup_attached(
+    stream: TcpStream,
+    ws_key: String,
+    head: bytes::Bytes,
+    admitted: AdmittedUpgrade,
+    ctx: Arc<ConnCtx>,
+    registry: Arc<Registry>,
+    rooms: Arc<RoomRegistry>,
+    identity: Arc<IdentityRegistry>,
+    authorizer: Option<Arc<Authorizer>>,
+) {
+    // On adopt failure (rare handshake-completion error), `admitted` drops at
+    // the end of this fn → its per-IP guard releases the slot; nothing else to
+    // clean up. On success we converge on the shared own-port tail.
+    if let Ok((sink, source)) = WebSocketTransport::adopt(stream, &ws_key, head, &ctx.config).await
+    {
+        run_admitted(
+            Accepted {
+                sink,
+                source,
+                upgrade: admitted,
+            },
+            ctx,
+            registry,
+            rooms,
+            identity,
+            authorizer,
+        )
+        .await;
+    }
+}
+
+/// Write an HTTP error status (pre-101 attach rejection) to the dup'd socket and
+/// close it. The client sees e.g. `429`/`503`; the SDK detaches the Node side.
+async fn write_http_error_and_close(mut stream: TcpStream, status: u16) {
+    use tokio::io::AsyncWriteExt;
+    let reason = match status {
+        HTTP_TOO_MANY_REQUESTS => "Too Many Requests",
+        HTTP_SERVICE_UNAVAILABLE => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    let resp =
+        format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
 }

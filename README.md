@@ -5,12 +5,34 @@
 Rust data plane, JavaScript control plane. Maximum connections, minimum overhead.
 
 **Status:** `0.1.0-alpha.0` — Phase 1D complete (presence, metrics, graceful
-close). Connections, rooms, users, and admission control all run in Rust; the
-whole per-message data plane stays off the JS event loop. Phase 0 gate met:
-RFC 0001 [results](docs/rfcs/0001-results.md) — Design C graduated. Alpha
-caveats: single-process (no clustering yet), and the headline benchmark +
-constants are still pending their pinned-box confirmation (see
+close) + Phase 1.1 HTTP-server attach (RFC 0002). Connections, rooms, users, and
+admission control all run in Rust; the whole per-message data plane stays off
+the JS event loop. Phase 0 gate met: RFC 0001
+[results](docs/rfcs/0001-results.md) — Design C graduated. Alpha caveats:
+single-process (no clustering yet), and the headline benchmark + constants are
+still pending their pinned-box confirmation (see
 [benchmarks](benchmarks/README.md)).
+
+## Attach to an existing Express/Fastify server (Phase 1.1)
+
+Run BeamSocket on your existing HTTP server — one port, one deployment. See
+[`examples/express-attach`](examples/express-attach).
+
+```ts
+const httpServer = app.listen(3000);           // your Express/Fastify server
+const io = new BeamSocket({ server: httpServer, path: '/ws' }); // no io.listen()
+io.on('connection', (socket) => socket.on('message', (d) => socket.send(d)));
+process.on('SIGTERM', async () => { await io.close(); httpServer.close(); }); // drain WS first
+```
+
+**Support matrix (RFC 0002).** TLS terminates at your load balancer (attach is
+plaintext); `{ server }` throws with a fallback pointer where unsupported.
+
+| Platform | Plaintext `http.Server` | `https.Server` |
+|---|---|---|
+| Linux | ✅ fd handoff | ❌ throws → TLS-at-LB / standalone port |
+| macOS | ✅ fd handoff (CI-gated) | ❌ throws |
+| Windows | ❌ throws → standalone `listen()` port | ❌ throws |
 
 ## Quickstart
 
