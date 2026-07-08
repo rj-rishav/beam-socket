@@ -4,14 +4,23 @@
 
 Rust data plane, JavaScript control plane. Maximum connections, minimum overhead.
 
-**Status:** `0.1.0-alpha.0` — Phase 1D complete (presence, metrics, graceful
-close) + Phase 1.1 HTTP-server attach (RFC 0002). Connections, rooms, users, and
-admission control all run in Rust; the whole per-message data plane stays off
-the JS event loop. Phase 0 gate met: RFC 0001
-[results](docs/rfcs/0001-results.md) — Design C graduated. Alpha caveats:
-single-process (no clustering yet), and the headline benchmark + constants are
-still pending their pinned-box confirmation (see
-[benchmarks](benchmarks/README.md)).
+**Status:** `0.1.0-alpha.0` — **Phase 1 + 1.1 merged to master** (echo, rooms,
+broadcast, identity, admission limits, presence, metrics, graceful close, HTTP
+attach), all gates closed in sequence; 60 Rust + 26 JS tests green on the merged
+tree. Connections, rooms, users, and admission control all run in Rust; the
+whole per-message data plane stays off the JS event loop. Phase 0 gate met: RFC
+0001 [results](docs/rfcs/0001-results.md) — Design C graduated. **Phase 2
+(runtime maturity / observability) is in progress** — see
+[ENGINEERING.md §12](docs/ENGINEERING.md).
+
+**Release blockers before the alpha goes public** (need real hardware /
+credentials, not closable in a sandbox): pinned-box bridge-constant
+re-confirmation (`--gate-seconds 600`), pinned-box benchmark suite (100k fan-out
+gate, Socket.IO ≥25k, echo p99), the full 10-minute soak, npm publish +
+per-platform install test, and the darwin CI run that proves the macOS attach
+row. **Parked backlog** (deliberately after Phase 2): RFC 0003 engine-side TLS
+(`listen(443, { cert })`, rustls) and the Windows fd-handoff spike
+(`WSADuplicateSocket`).
 
 ## Attach to an existing Express/Fastify server (Phase 1.1)
 
