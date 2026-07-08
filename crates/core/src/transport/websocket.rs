@@ -13,18 +13,23 @@
 //! the RFC-correct close frames on the wire. The engine only sees the
 //! transport-neutral `InFrame`/`TransportError` view.
 
+use std::io;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
 
@@ -40,10 +45,77 @@ use crate::transport::{
 /// buffers to 4 KB initial"). Re-validated by the 10k-idle RSS gate.
 const READ_BUFFER_SIZE: usize = 4 * 1024;
 
+/// A TCP stream with an optional REPLAY prefix on its read side (RFC 0002 §8.3).
+/// Reads yield `head` first, then the socket; writes pass straight through.
+/// Own-port connections use an EMPTY head, so the codec sees the raw socket —
+/// this unifies `accept` and `adopt` on ONE concrete stream type (so
+/// `WsSink`/`WsSource` have one type), at essentially zero cost when empty.
+///
+/// `TcpStream` + `Vec`/`usize` are all `Unpin`, so no pin-projection is needed.
+pub struct PrefixedStream {
+    head: Vec<u8>,
+    pos: usize,
+    inner: TcpStream,
+}
+
+impl PrefixedStream {
+    /// Own-port: no replay prefix (the codec reads the socket directly).
+    fn direct(inner: TcpStream) -> Self {
+        Self {
+            head: Vec::new(),
+            pos: 0,
+            inner,
+        }
+    }
+
+    /// Attach: replay `head` (the bytes Node already read) before the wire.
+    fn prefixed(head: Vec<u8>, inner: TcpStream) -> Self {
+        Self {
+            head,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        if me.pos < me.head.len() {
+            let remaining = &me.head[me.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            me.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut me.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PrefixedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 pub struct WebSocketTransport;
 
-pub struct WsSource(SplitStream<WebSocketStream<TcpStream>>);
-pub struct WsSink(SplitSink<WebSocketStream<TcpStream>, Message>);
+pub struct WsSource(SplitStream<WebSocketStream<PrefixedStream>>);
+pub struct WsSink(SplitSink<WebSocketStream<PrefixedStream>, Message>);
 
 fn map_err(e: WsError) -> TransportError {
     let (close_code, message) = match &e {
@@ -74,10 +146,7 @@ impl Transport for WebSocketTransport {
     ) -> Result<Accepted<Self::Sink, Self::Source>, AcceptError> {
         // max_payload_bytes enforced in Rust before any JS runs: a frame or
         // message over the cap is rejected by the codec with close 1009.
-        let ws_cfg = WebSocketConfig::default()
-            .max_message_size(Some(config.limits.max_payload_bytes))
-            .max_frame_size(Some(config.limits.max_payload_bytes))
-            .read_buffer_size(READ_BUFFER_SIZE);
+        let ws_cfg = ws_config(config);
 
         // The gate runs INSIDE the handshake callback (sync): resolve the
         // client IP and enforce maxConnectionsPerIp BEFORE the upgrade
@@ -119,6 +188,8 @@ impl Transport for WebSocketTransport {
             }
         };
 
+        // Own-port: the codec reads the raw socket (empty replay prefix).
+        let io = PrefixedStream::direct(io);
         match tokio_tungstenite::accept_hdr_async_with_config(io, callback, Some(ws_cfg)).await {
             Ok(ws) => {
                 let upgrade = slot
@@ -143,6 +214,53 @@ impl Transport for WebSocketTransport {
             },
         }
     }
+
+    async fn adopt(
+        io: TcpStream,
+        ws_key: &str,
+        head: Bytes,
+        config: &Config,
+    ) -> Result<(Self::Sink, Self::Source), TransportError> {
+        // The gate already ran in `engine.attach`; this only finishes the 101
+        // and starts framing over head-then-wire (RFC 0002 §8.3).
+        let _ = io.set_nodelay(true);
+        let mut stream = PrefixedStream::prefixed(head.to_vec(), io);
+
+        // Write the 101 ourselves — Node parsed the request, so tungstenite's
+        // server handshake has nothing to read. Sec-WebSocket-Accept is derived
+        // from the pre-parsed key (same computation tungstenite does).
+        let accept_key = derive_accept_key(ws_key.as_bytes());
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
+        );
+        stream
+            .write_all(resp.as_bytes())
+            .await
+            .map_err(|e| TransportError {
+                close_code: 1006,
+                message: format!("attach: 101 write failed: {e}"),
+            })?;
+        stream.flush().await.map_err(|e| TransportError {
+            close_code: 1006,
+            message: format!("attach: 101 flush failed: {e}"),
+        })?;
+
+        // Frame over head-then-wire. The handshake is already done, so start the
+        // codec directly (Role::Server) — head is replayed before socket bytes.
+        let ws =
+            WebSocketStream::from_raw_socket(stream, Role::Server, Some(ws_config(config))).await;
+        let (sink, source) = ws.split();
+        Ok((WsSink(sink), WsSource(source)))
+    }
+}
+
+/// Shared codec config (payload caps + tuned read buffer) for both `accept`
+/// and `adopt`.
+fn ws_config(config: &Config) -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(config.limits.max_payload_bytes))
+        .max_frame_size(Some(config.limits.max_payload_bytes))
+        .read_buffer_size(READ_BUFFER_SIZE)
 }
 
 impl FrameSource for WsSource {

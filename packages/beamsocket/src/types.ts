@@ -59,6 +59,29 @@ export interface BeamSocketConfig {
   keepalive?: Keepalive;
   trustProxy?: TrustProxy;
   authorize?: AuthorizeConfig;
+  /**
+   * Attach to an existing Node `http.Server` (Phase 1.1, RFC 0002) instead of
+   * owning a port. Mutually exclusive with `listen()`. Plaintext `http.Server`
+   * only — passing an `https.Server`, or running on Windows, throws (terminate
+   * TLS at your load balancer / use a standalone port). Each WebSocket upgrade's
+   * socket is handed off to the Rust engine via fd handoff.
+   */
+  server?: HttpServerLike;
+  /**
+   * Claim only upgrades whose request path equals `path` (e.g. `'/ws'`), so
+   * BeamSocket can coexist with other upgrade listeners. Omit to claim ALL
+   * upgrades on the server (sole-handler mode — malformed upgrades get a 400).
+   */
+  path?: string;
+}
+
+/**
+ * The subset of Node's `http.Server` the SDK uses for attach — kept structural
+ * so `beamsocket` need not depend on `@types/node` at its public boundary.
+ */
+export interface HttpServerLike {
+  on(event: 'upgrade', listener: (req: any, socket: any, head: Buffer) => void): unknown;
+  removeListener(event: 'upgrade', listener: (req: any, socket: any, head: Buffer) => void): unknown;
 }
 
 export interface AuthorizeRequest {

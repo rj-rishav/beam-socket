@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use beamsocket_core::broadcast::FanoutReport;
 use beamsocket_core::config::{BackpressurePolicy, Config, TrustProxy};
+#[cfg(unix)]
+use beamsocket_core::engine::{AttachOutcome, ParsedUpgrade};
 use beamsocket_core::engine::{Engine, SendStatus};
 use beamsocket_core::identity::AuthorizeOutcome;
 use beamsocket_core::ids::ConnectionId;
@@ -434,6 +436,69 @@ impl BeamEngine {
 
     /// The (connectionId halves, userId) pairs of a room's live members — ONE
     /// FFI call. The SDK joins metadata (which lives in JS) per entry.
+    /// **Phase 1.1 attach (RFC 0002 §4).** `dup()` the Node upgrade fd, adopt it
+    /// on the engine runtime, and return Accepted / Rejected(status). Unix only
+    /// (Windows fd handoff is deferred, §7 — the SDK throws before calling this
+    /// on Windows). `headers_flat` is `[k0,v0,k1,v1,…]`.
+    #[cfg(unix)]
+    #[napi]
+    pub fn attach(
+        &self,
+        fd: i32,
+        remote_addr: String,
+        method: String,
+        url: String,
+        headers_flat: Vec<String>,
+        head: Buffer,
+    ) -> Result<JsAttachResult> {
+        let engine = self.engine()?;
+        let peer: std::net::IpAddr = remote_addr
+            .parse()
+            .map_err(|_| Error::from_reason(format!("attach: bad remoteAddr {remote_addr:?}")))?;
+        // Flat [k0,v0,k1,v1,…] → (lowercased key, value) pairs (same shape the
+        // own-port handshake captures).
+        let mut headers = Vec::with_capacity(headers_flat.len() / 2);
+        for pair in headers_flat.chunks_exact(2) {
+            headers.push((pair[0].to_ascii_lowercase(), pair[1].clone()));
+        }
+        let parsed = ParsedUpgrade {
+            method,
+            url,
+            headers,
+        };
+        let head = bytes::Bytes::from(head.to_vec());
+
+        // dup → RAII guard (closes the dup on any early bail) → hand ownership to
+        // a std TcpStream → engine (§9). All validation above happens BEFORE the
+        // dup, so a malformed request never leaks an fd.
+        let dup = unsafe { libc::dup(fd) };
+        if dup < 0 {
+            return Ok(JsAttachResult {
+                accepted: false,
+                status: 500.0,
+            });
+        }
+        let guard = FdHandoffGuard::new(dup);
+        let std_stream = guard.into_std_stream(); // disarm + ownership transfer
+        if std_stream.set_nonblocking(true).is_err() {
+            // std_stream drops here → closes the fd; no leak, no double close.
+            return Ok(JsAttachResult {
+                accepted: false,
+                status: 500.0,
+            });
+        }
+        Ok(match engine.attach(std_stream, peer, parsed, head) {
+            AttachOutcome::Accepted => JsAttachResult {
+                accepted: true,
+                status: 0.0,
+            },
+            AttachOutcome::Rejected(s) => JsAttachResult {
+                accepted: false,
+                status: s as f64,
+            },
+        })
+    }
+
     #[napi]
     pub fn presence_list(&self, room: String) -> Result<Vec<JsPresenceEntry>> {
         let engine = self.engine()?;
@@ -565,6 +630,48 @@ pub struct JsPresenceEntry {
     pub id_lo: u32,
     pub user_id: String,
     pub has_user_id: bool,
+}
+
+/// Result of `attach` (Phase 1.1). `accepted` → handoff in progress (Rust owns
+/// the connection); otherwise `status` is the HTTP status Rust wrote to the fd.
+#[napi(object)]
+pub struct JsAttachResult {
+    pub accepted: bool,
+    pub status: f64,
+}
+
+/// RAII for the dup'd upgrade fd (RFC 0002 §9), mirroring 1C's `IpAdmitGuard`:
+/// armed at `dup`, disarmed the instant ownership passes to a std `TcpStream`.
+/// If we bail between the two, `Drop` closes the dup exactly once — no leak; the
+/// Node original is a separate fd (closed by JS `destroy()`), so no double close.
+#[cfg(unix)]
+struct FdHandoffGuard {
+    fd: std::os::fd::RawFd,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl FdHandoffGuard {
+    fn new(fd: std::os::fd::RawFd) -> Self {
+        Self { fd, armed: true }
+    }
+
+    /// Disarm and hand the fd to a std `TcpStream` (the ownership-transfer
+    /// point — "Tokio adoption" in §9; `from_std` then moves it to the reactor).
+    fn into_std_stream(mut self) -> std::net::TcpStream {
+        use std::os::fd::FromRawFd;
+        self.armed = false;
+        unsafe { std::net::TcpStream::from_raw_fd(self.fd) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FdHandoffGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { libc::close(self.fd) };
+        }
+    }
 }
 
 /// Backs `BeamEngine::close` (Phase 1D). Runs the graceful drain on the libuv
