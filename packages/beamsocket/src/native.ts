@@ -12,6 +12,21 @@ import { fileURLToPath } from 'node:url';
 
 const requireNative = createRequire(import.meta.url);
 
+/**
+ * napi maps snake_case fields to camelCase, capitalizing the first letter after
+ * a digit boundary: `messages_in_1s` → `messagesIn1S` (note the capital S).
+ */
+export interface NativeRates {
+  messagesIn1S: number;
+  messagesIn10S: number;
+  messagesOut1S: number;
+  messagesOut10S: number;
+  bytesIn1S: number;
+  bytesIn10S: number;
+  bytesOut1S: number;
+  bytesOut10S: number;
+}
+
 export interface NativeStats {
   connections: number;
   users: number;
@@ -27,6 +42,40 @@ export interface NativeStats {
   authorizeRejected: number;
   authorizeTimedOut: number;
   pendingOverflow: number;
+  // Phase 2A
+  uptimeMs: number;
+  rates: NativeRates | null;
+}
+
+export interface NativeRoomStat {
+  room: string;
+  members: number;
+  messages: number;
+  exists: boolean;
+}
+
+export interface NativeMemoryUsage {
+  connections: number;
+  rooms: number;
+  users: number;
+  estimatedHeapBytes: number;
+  mailboxBytesInFlight: number;
+  estimated: boolean;
+}
+
+export interface NativeMailbox {
+  idHi: number;
+  idLo: number;
+  userId: string;
+  hasUserId: boolean;
+  depthBytes: number;
+  hwmBytes: number;
+  hwmPercent: number;
+}
+
+export interface NativeBackpressureReport {
+  totalDrops: number;
+  mailboxes: NativeMailbox[];
 }
 
 export interface NativeConfig {
@@ -43,6 +92,8 @@ export interface NativeConfig {
   trustProxyCidrs?: string[];
   authorizeTimeoutMs?: number;
   maxPendingAuthorizations?: number;
+  // Phase 2A
+  samplerMs?: number;
 }
 
 /** Send status codes from crates/node/src/binding.rs. */
@@ -106,6 +157,14 @@ export interface NativeEngine {
   broadcastTextUser(userId: string, data: string, except: Uint32Array): NativeFanout;
   // Phase 1D — presence. One FFI call returns the room's (id, userId) pairs.
   presenceList(room: string): NativePresenceEntry[];
+  // Phase 2A — observability read surface (one FFI call each).
+  topRooms(n: number): NativeRoomStat[];
+  roomInfo(room: string): NativeRoomStat;
+  memoryUsage(): NativeMemoryUsage;
+  backpressureReport(topN: number): NativeBackpressureReport;
+  /** Flat [hi0, lo0, hi1, lo1, …] device id pairs. */
+  userConnections(userId: string): Uint32Array;
+  metricsText(): string;
   // Phase 1.1 — HTTP attach (Unix only; the SDK throws on Windows before here).
   // `headersFlat` is [k0,v0,k1,v1,…] (e.g. req.rawHeaders).
   attach(
