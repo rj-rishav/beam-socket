@@ -62,7 +62,9 @@ pub fn broadcast(
     match target {
         FanoutTarget::Room(room) => {
             // Copy out + release the room guard before touching conn shards.
-            let Some(members) = rooms.members(room) else {
+            // `record_and_members` also bumps the room's Phase 2A message counter
+            // in this SAME lookup — no new lookup, no per-message work elsewhere.
+            let Some(members) = rooms.record_and_members(room) else {
                 return report;
             };
             fan_out_ids(conns, members, &payload, is_binary, except, &mut report);

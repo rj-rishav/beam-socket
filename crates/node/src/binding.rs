@@ -17,7 +17,7 @@ use beamsocket_core::engine::{AttachOutcome, ParsedUpgrade};
 use beamsocket_core::engine::{Engine, SendStatus};
 use beamsocket_core::identity::AuthorizeOutcome;
 use beamsocket_core::ids::ConnectionId;
-use beamsocket_core::metrics::Metrics;
+use beamsocket_core::metrics::{Metrics, Rates};
 use beamsocket_core::rooms::MembershipChange;
 
 use napi::bindgen_prelude::*;
@@ -59,6 +59,9 @@ pub struct JsConfig {
     pub authorize_timeout_ms: Option<f64>,
     /// Bounded pending-upgrade table size (Rule 5).
     pub max_pending_authorizations: Option<f64>,
+    // ── Phase 2A ──
+    /// Rate-sampler interval (ms). Default 1000; 0 disables the sampler.
+    pub sampler_ms: Option<f64>,
 }
 
 fn to_config(js: JsConfig) -> Result<Config> {
@@ -109,6 +112,9 @@ fn to_config(js: JsConfig) -> Result<Config> {
     if let Some(v) = js.max_pending_authorizations {
         c.authorize.max_pending = v as usize;
     }
+    if let Some(v) = js.sampler_ms {
+        c.observability.sampler_ms = v.max(0.0) as u64;
+    }
     // Surface config errors (e.g. a malformed trustProxy CIDR) at construction.
     c.validate()
         .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -135,6 +141,65 @@ pub struct JsStats {
     pub authorize_rejected: f64,
     pub authorize_timed_out: f64,
     pub pending_overflow: f64,
+    // ── Phase 2A ──
+    pub uptime_ms: f64,
+    /// EWMA rates; `None` when the sampler is disabled (`samplerMs: 0`).
+    pub rates: Option<JsRates>,
+}
+
+/// EWMA rate snapshot (Phase 2A): each rate over a ~1 s and a ~10 s window.
+#[napi(object)]
+pub struct JsRates {
+    pub messages_in_1s: f64,
+    pub messages_in_10s: f64,
+    pub messages_out_1s: f64,
+    pub messages_out_10s: f64,
+    pub bytes_in_1s: f64,
+    pub bytes_in_10s: f64,
+    pub bytes_out_1s: f64,
+    pub bytes_out_10s: f64,
+}
+
+/// One `topRooms` / `room().info()` row (Phase 2A).
+#[napi(object)]
+pub struct JsRoomStat {
+    pub room: String,
+    pub members: f64,
+    pub messages: f64,
+    /// `room().info()` only: false when the room doesn't exist.
+    pub exists: bool,
+}
+
+/// One `backpressureReport` mailbox (Phase 2A).
+#[napi(object)]
+pub struct JsMailbox {
+    pub id_hi: u32,
+    pub id_lo: u32,
+    pub user_id: String,
+    pub has_user_id: bool,
+    pub depth_bytes: f64,
+    pub hwm_bytes: f64,
+    pub hwm_percent: f64,
+}
+
+/// `backpressureReport({topN})` (Phase 2A).
+#[napi(object)]
+pub struct JsBackpressureReport {
+    /// Global drop total (per-connection attribution is deferred — §12.1).
+    pub total_drops: f64,
+    pub mailboxes: Vec<JsMailbox>,
+}
+
+/// `memoryUsage()` (Phase 2A). `estimated_heap_bytes` is a model; `estimated` is
+/// always true.
+#[napi(object)]
+pub struct JsMemoryUsage {
+    pub connections: f64,
+    pub rooms: f64,
+    pub users: f64,
+    pub estimated_heap_bytes: f64,
+    pub mailbox_bytes_in_flight: f64,
+    pub estimated: bool,
 }
 
 #[inline]
@@ -536,7 +601,108 @@ impl BeamEngine {
             authorize_rejected: m.authorize_rejected.load(Ordering::Relaxed) as f64,
             authorize_timed_out: m.authorize_timed_out.load(Ordering::Relaxed) as f64,
             pending_overflow: m.pending_overflow.load(Ordering::Relaxed) as f64,
+            uptime_ms: engine.uptime_ms() as f64,
+            rates: engine.rates().map(|r| JsRates {
+                messages_in_1s: Rates::load(&r.messages_in_1s),
+                messages_in_10s: Rates::load(&r.messages_in_10s),
+                messages_out_1s: Rates::load(&r.messages_out_1s),
+                messages_out_10s: Rates::load(&r.messages_out_10s),
+                bytes_in_1s: Rates::load(&r.bytes_in_1s),
+                bytes_in_10s: Rates::load(&r.bytes_in_10s),
+                bytes_out_1s: Rates::load(&r.bytes_out_1s),
+                bytes_out_10s: Rates::load(&r.bytes_out_10s),
+            }),
         })
+    }
+
+    // ── Phase 2A: observability read surface (one FFI call per query) ──
+
+    /// `topRooms(n)` — the n most-populated rooms. `n` is clamped to `[1, 100]`;
+    /// a request of 0 or negative is an error.
+    #[napi]
+    pub fn top_rooms(&self, n: i32) -> Result<Vec<JsRoomStat>> {
+        let n = clamp_top_n(n)?;
+        Ok(self
+            .engine()?
+            .top_rooms(n)
+            .into_iter()
+            .map(|s| JsRoomStat {
+                room: s.room,
+                members: s.members as f64,
+                messages: s.messages as f64,
+                exists: true,
+            })
+            .collect())
+    }
+
+    /// `room(id).info()` — member + message counts. `exists` is `members > 0`:
+    /// an empty room cannot survive (auto-destroyed on last leave), so a room
+    /// with no members does not exist.
+    #[napi]
+    pub fn room_info(&self, room: String) -> Result<JsRoomStat> {
+        let s = self.engine()?.room_info(&room);
+        Ok(JsRoomStat {
+            room: s.room,
+            members: s.members as f64,
+            messages: s.messages as f64,
+            exists: s.members > 0,
+        })
+    }
+
+    /// `memoryUsage()` — structural model + measured mailbox bytes-in-flight.
+    #[napi]
+    pub fn memory_usage(&self) -> Result<JsMemoryUsage> {
+        let u = self.engine()?.memory_usage();
+        Ok(JsMemoryUsage {
+            connections: u.connections as f64,
+            rooms: u.rooms as f64,
+            users: u.users as f64,
+            estimated_heap_bytes: u.estimated_heap_bytes as f64,
+            mailbox_bytes_in_flight: u.mailbox_bytes_in_flight as f64,
+            estimated: u.estimated,
+        })
+    }
+
+    /// `backpressureReport({topN})` — the topN deepest send queues + drop total.
+    #[napi]
+    pub fn backpressure_report(&self, top_n: i32) -> Result<JsBackpressureReport> {
+        let top_n = clamp_top_n(top_n)?;
+        let report = self.engine()?.backpressure_report(top_n);
+        Ok(JsBackpressureReport {
+            total_drops: report.total_drops as f64,
+            mailboxes: report
+                .mailboxes
+                .into_iter()
+                .map(|s| JsMailbox {
+                    id_hi: (s.id.0 >> 32) as u32,
+                    id_lo: s.id.0 as u32,
+                    user_id: s.user.as_ref().map(|u| u.0.clone()).unwrap_or_default(),
+                    has_user_id: s.user.is_some(),
+                    depth_bytes: s.depth_bytes as f64,
+                    hwm_bytes: s.hwm_bytes as f64,
+                    hwm_percent: s.hwm_percent,
+                })
+                .collect(),
+        })
+    }
+
+    /// `user(id).connections()` — the user's live device ids as a flat
+    /// `[hi0, lo0, hi1, lo1, …]` array (the SDK encodes them to socket ids).
+    #[napi]
+    pub fn user_connections(&self, user_id: String) -> Result<Uint32Array> {
+        let ids = self.engine()?.user_connections(&user_id);
+        let mut out = Vec::with_capacity(ids.len() * 2);
+        for id in ids {
+            out.push((id.0 >> 32) as u32);
+            out.push(id.0 as u32);
+        }
+        Ok(Uint32Array::new(out))
+    }
+
+    /// `metricsText()` — Prometheus text exposition (Phase 2A).
+    #[napi]
+    pub fn metrics_text(&self) -> Result<String> {
+        Ok(self.engine()?.metrics_text())
     }
 
     /// Graceful close (Phase 1D): stop admitting (new upgrades → 503), drain
@@ -575,6 +741,18 @@ impl BeamEngine {
             .as_ref()
             .ok_or_else(|| Error::from_reason("engine already shut down"))
     }
+}
+
+/// Validate/clamp a top-N request (Phase 2A §12 rule 2 — bounded output).
+/// `n <= 0` is an error; `n > 100` is CLAMPED to the hard cap of 100 (documented
+/// behavior, not an error).
+fn clamp_top_n(n: i32) -> Result<usize> {
+    if n <= 0 {
+        return Err(Error::from_reason(format!(
+            "topN must be a positive integer (got {n})"
+        )));
+    }
+    Ok((n as usize).min(100))
 }
 
 fn status_code(s: SendStatus) -> u32 {
