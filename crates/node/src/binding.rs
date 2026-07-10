@@ -141,6 +141,9 @@ pub struct JsStats {
     pub authorize_rejected: f64,
     pub authorize_timed_out: f64,
     pub pending_overflow: f64,
+    // ── Phase 2B admin-action counters ──
+    pub admin_disconnects: f64,
+    pub admin_room_closes: f64,
     // ── Phase 2A ──
     pub uptime_ms: f64,
     /// EWMA rates; `None` when the sampler is disabled (`samplerMs: 0`).
@@ -601,6 +604,8 @@ impl BeamEngine {
             authorize_rejected: m.authorize_rejected.load(Ordering::Relaxed) as f64,
             authorize_timed_out: m.authorize_timed_out.load(Ordering::Relaxed) as f64,
             pending_overflow: m.pending_overflow.load(Ordering::Relaxed) as f64,
+            admin_disconnects: m.admin_disconnects.load(Ordering::Relaxed) as f64,
+            admin_room_closes: m.admin_room_closes.load(Ordering::Relaxed) as f64,
             uptime_ms: engine.uptime_ms() as f64,
             rates: engine.rates().map(|r| JsRates {
                 messages_in_1s: Rates::load(&r.messages_in_1s),
@@ -703,6 +708,42 @@ impl BeamEngine {
     #[napi]
     pub fn metrics_text(&self) -> Result<String> {
         Ok(self.engine()?.metrics_text())
+    }
+
+    // ── Phase 2B: admin actions (§12.2). One FFI call each; the sweeps run in
+    // beamsocket-core over the EXISTING close/cleanup paths. Unlike the read
+    // queries these do NOT error after `close()`/`shutdown()`: an admin verb
+    // racing a drain is a safe no-op that reports 0 (§12.2 required test), the
+    // same answer a nonexistent target gets. ──
+
+    /// `disconnectSocket` — returns 1 if the connection existed and its close
+    /// was initiated, else 0. Code validation (1000 / 4000–4999) is SDK-side.
+    #[napi]
+    pub fn disconnect_socket(&self, id_hi: u32, id_lo: u32, code: u32) -> f64 {
+        match &self.engine {
+            Some(e) => e.admin_disconnect_socket(conn_id(id_hi, id_lo), code as u16) as f64,
+            None => 0.0, // draining/shut down → safe no-op
+        }
+    }
+
+    /// `disconnectUser` — returns the number of devices closed (0 = unknown/
+    /// offline user, or the engine is draining).
+    #[napi]
+    pub fn disconnect_user(&self, user_id: String, code: u32) -> f64 {
+        match &self.engine {
+            Some(e) => e.admin_disconnect_user(&user_id, code as u16) as f64,
+            None => 0.0, // draining/shut down → safe no-op
+        }
+    }
+
+    /// `closeRoom` — returns the number of memberships removed (0 = no such
+    /// room, or the engine is draining). Disconnect-free: connections live on.
+    #[napi]
+    pub fn close_room(&self, room: String) -> f64 {
+        match &self.engine {
+            Some(e) => e.admin_close_room(&room) as f64,
+            None => 0.0, // draining/shut down → safe no-op
+        }
     }
 
     /// Graceful close (Phase 1D): stop admitting (new upgrades → 503), drain

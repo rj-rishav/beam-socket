@@ -33,6 +33,14 @@ pub struct Metrics {
     /// Handshakes rejected because the bounded pending-upgrade table was full
     /// (Rule 5 overflow policy for the authorize round-trip).
     pub pending_overflow: AtomicU64,
+
+    // ── Phase 2B admin actions (§12.2) — control-plane counters, bumped once
+    // per admin call's sweep, never on the message path. ──
+    /// Connections closed by `disconnectSocket`/`disconnectUser` (one per
+    /// connection actually closed, so a 3-device `disconnectUser` counts 3).
+    pub admin_disconnects: AtomicU64,
+    /// Rooms closed by `closeRoom` (one per call that found the room).
+    pub admin_room_closes: AtomicU64,
 }
 
 impl Metrics {
