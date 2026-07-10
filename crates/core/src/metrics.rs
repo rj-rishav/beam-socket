@@ -51,3 +51,31 @@ impl Metrics {
         counter.load(Ordering::Relaxed)
     }
 }
+
+/// Derived EWMA rates (Phase 2A), written ONLY by the 1 Hz sampler task and read
+/// lock-free by `stats()`. Each rate is an f64 stored as its bit pattern in an
+/// `AtomicU64`, over a ~1 s and a ~10 s window. The sampler reads the counters
+/// above; it never touches the message path (§12 rule 1 — zero hot-path cost).
+#[derive(Debug, Default)]
+pub struct Rates {
+    pub messages_in_1s: AtomicU64,
+    pub messages_in_10s: AtomicU64,
+    pub messages_out_1s: AtomicU64,
+    pub messages_out_10s: AtomicU64,
+    pub bytes_in_1s: AtomicU64,
+    pub bytes_in_10s: AtomicU64,
+    pub bytes_out_1s: AtomicU64,
+    pub bytes_out_10s: AtomicU64,
+}
+
+impl Rates {
+    #[inline]
+    pub fn store(slot: &AtomicU64, value: f64) {
+        slot.store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn load(slot: &AtomicU64) -> f64 {
+        f64::from_bits(slot.load(Ordering::Relaxed))
+    }
+}

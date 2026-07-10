@@ -1,11 +1,23 @@
 import { EventEmitter } from 'node:events';
 
-import type { AuthorizeRequest, AuthorizeResult, BeamSocketConfig, CloseOptions, Metrics } from './types.js';
+import type {
+  AuthorizeRequest,
+  AuthorizeResult,
+  BackpressureReport,
+  BeamSocketConfig,
+  CloseOptions,
+  MemoryUsage,
+  Metrics,
+  RoomHandle,
+  RoomStat,
+  Stats,
+  UserHandle,
+} from './types.js';
 import { RejectCode } from './types.js';
 import { BoundedMetaMap } from './correlation.js';
 import { demux } from './events.js';
-import { decodeSocketId } from './ids.js';
-import { loadNative, type NativeConfig, type NativeEngine } from './native.js';
+import { decodeSocketId, encodeSocketId } from './ids.js';
+import { loadNative, type NativeConfig, type NativeEngine, type NativeStats } from './native.js';
 import { Presence } from './presence.js';
 import { Target } from './rooms.js';
 import { Socket } from './socket.js';
@@ -79,6 +91,7 @@ function toNativeConfig(config: BeamSocketConfig): NativeConfig {
     trustProxyCidrs,
     authorizeTimeoutMs: config.authorize?.timeoutMs,
     maxPendingAuthorizations: config.authorize?.maxPending,
+    samplerMs: config.observability?.samplerMs,
   };
 }
 
@@ -180,9 +193,7 @@ export class BeamSocket extends EventEmitter {
     });
   }
 
-  /** One-FFI-call snapshot of the runtime counters (Phase 1D). */
-  metrics(): Metrics {
-    const s = this.#requireEngine('metrics').stats();
+  #mapMetrics(s: NativeStats): Metrics {
     return {
       connections: s.connections,
       users: s.users,
@@ -200,6 +211,99 @@ export class BeamSocket extends EventEmitter {
       pendingOverflow: s.pendingOverflow,
       // JS-owned counter (the correlation map lives here, not in Rust).
       authMetadataEvicted: this.#pendingAuth.evicted,
+    };
+  }
+
+  /** One-FFI-call snapshot of the runtime counters (Phase 1D). */
+  metrics(): Metrics {
+    return this.#mapMetrics(this.#requireEngine('metrics').stats());
+  }
+
+  /** Full runtime snapshot: counters + uptime + sampler rates (Phase 2A). */
+  stats(): Stats {
+    const s = this.#requireEngine('stats').stats();
+    return {
+      ...this.#mapMetrics(s),
+      uptimeMs: s.uptimeMs,
+      rates: s.rates
+        ? {
+            messagesIn: { perSec1s: s.rates.messagesIn1S, perSec10s: s.rates.messagesIn10S },
+            messagesOut: { perSec1s: s.rates.messagesOut1S, perSec10s: s.rates.messagesOut10S },
+            bytesIn: { perSec1s: s.rates.bytesIn1S, perSec10s: s.rates.bytesIn10S },
+            bytesOut: { perSec1s: s.rates.bytesOut1S, perSec10s: s.rates.bytesOut10S },
+          }
+        : null,
+    };
+  }
+
+  /** Live connection count (Phase 2A). */
+  connectionCount(): number {
+    return this.#requireEngine('connectionCount').connectionCount();
+  }
+
+  /** The `n` most-populated rooms, highest first (Phase 2A). `n` (default 10) is
+   * clamped to a hard cap of 100; a non-positive `n` throws. */
+  topRooms(n = 10): RoomStat[] {
+    return this.#requireEngine('topRooms')
+      .topRooms(n)
+      .map((r) => ({ room: r.room, members: r.members, messages: r.messages }));
+  }
+
+  /** Structural memory model + measured mailbox bytes-in-flight (Phase 2A). */
+  memoryUsage(): MemoryUsage {
+    const u = this.#requireEngine('memoryUsage').memoryUsage();
+    return {
+      connections: u.connections,
+      rooms: u.rooms,
+      users: u.users,
+      estimatedHeapBytes: u.estimatedHeapBytes,
+      mailboxBytesInFlight: u.mailboxBytesInFlight,
+      estimated: true,
+    };
+  }
+
+  /** The `topN` deepest send queues + the global drop total (Phase 2A). `topN`
+   * (default 10) is clamped to 100; non-positive throws. */
+  backpressureReport({ topN = 10 }: { topN?: number } = {}): BackpressureReport {
+    const r = this.#requireEngine('backpressureReport').backpressureReport(topN);
+    return {
+      totalDrops: r.totalDrops,
+      mailboxes: r.mailboxes.map((m) => ({
+        socketId: encodeSocketId(m.idHi, m.idLo),
+        userId: m.hasUserId ? m.userId : undefined,
+        depthBytes: m.depthBytes,
+        hwmBytes: m.hwmBytes,
+        hwmPercent: m.hwmPercent,
+      })),
+    };
+  }
+
+  /** Prometheus text exposition of the counters + rates (Phase 2A). */
+  metricsText(): string {
+    return this.#requireEngine('metricsText').metricsText();
+  }
+
+  /** Query handle for a user (Phase 2A): `io.user(id).connections()`. */
+  user(userId: string): UserHandle {
+    const engine = this.#requireEngine('user');
+    return {
+      connections: () => {
+        const flat = engine.userConnections(userId);
+        const out: string[] = [];
+        for (let i = 0; i + 1 < flat.length; i += 2) out.push(encodeSocketId(flat[i]!, flat[i + 1]!));
+        return out;
+      },
+    };
+  }
+
+  /** Query handle for a room (Phase 2A): `io.room(id).info()`. */
+  room(roomId: string): RoomHandle {
+    const engine = this.#requireEngine('room');
+    return {
+      info: () => {
+        const s = engine.roomInfo(roomId);
+        return { room: s.room, members: s.members, messages: s.messages, exists: s.exists };
+      },
     };
   }
 

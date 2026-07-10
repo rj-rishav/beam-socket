@@ -99,6 +99,22 @@ impl Default for Authorize {
     }
 }
 
+/// Observability (Phase 2A). The only new runtime element is a 1 Hz sampler
+/// task that derives rates from the EXISTING counters — never per-message work
+/// (§12 rule 1: diagnostics are free when unused).
+#[derive(Debug, Clone)]
+pub struct Observability {
+    /// Sampler tick interval, ms. Default 1000 (1 Hz). **0 disables the sampler
+    /// entirely** — no task, and `stats().rates` reports absent.
+    pub sampler_ms: u64,
+}
+
+impl Default for Observability {
+    fn default() -> Self {
+        Self { sampler_ms: 1000 }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub limits: Limits,
@@ -106,6 +122,7 @@ pub struct Config {
     pub keepalive: Keepalive,
     pub trust_proxy: TrustProxy,
     pub authorize: Authorize,
+    pub observability: Observability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

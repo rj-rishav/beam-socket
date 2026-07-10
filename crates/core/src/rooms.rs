@@ -23,16 +23,55 @@
 //! in the room set + one RoomId clone (~room-name bytes + 24 B) in the conn
 //! entry — measured number in the PR notes.
 
-use std::collections::HashSet;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
+use std::sync::atomic::AtomicU64;
 
 use dashmap::DashMap;
 
 use crate::connection::registry::Registry;
 use crate::ids::{ConnectionId, RoomId};
+use crate::metrics::Metrics;
+
+/// A room's state: its members plus a cumulative message counter (Phase 2A).
+/// The counter is `+8 B/room` (Rule 4) and is bumped ONLY on the existing Room
+/// fan-out path, where the room is already resolved — no new lookup, no
+/// per-message work anywhere else (§12 rule 1).
+#[derive(Default)]
+struct RoomEntry {
+    members: HashSet<ConnectionId>,
+    messages: AtomicU64,
+}
+
+/// One row of `topRooms` / `room().info()` (Phase 2A). `Ord` ranks rooms:
+/// member count, then message count, then room name ASC — a total, deterministic
+/// order so the top-N agrees with the reference model under churn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoomStat {
+    pub room: String,
+    pub members: usize,
+    pub messages: u64,
+}
+
+impl Ord for RoomStat {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.members
+            .cmp(&other.members)
+            .then(self.messages.cmp(&other.messages))
+            // A smaller room name ranks HIGHER, so it must compare as `Greater`.
+            .then_with(|| other.room.cmp(&self.room))
+    }
+}
+
+impl PartialOrd for RoomStat {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[derive(Default)]
 pub struct RoomRegistry {
-    rooms: DashMap<RoomId, HashSet<ConnectionId>>,
+    rooms: DashMap<RoomId, RoomEntry>,
 }
 
 /// Outcome of a join/leave, surfaced to the SDK (frame-delivery-grade
@@ -65,12 +104,68 @@ impl RoomRegistry {
     pub fn members(&self, room: &RoomId) -> Option<Vec<ConnectionId>> {
         self.rooms
             .get(room)
-            .map(|set| set.iter().copied().collect())
+            .map(|e| e.members.iter().copied().collect())
+    }
+
+    /// Broadcast path (Phase 2A): copy the members out AND bump the room's
+    /// message counter in the SAME `get` — this REPLACES the `members()` lookup
+    /// the Room fan-out already did, so it adds no new lookup and no per-message
+    /// work outside the one fan-out that was going to happen anyway.
+    pub fn record_and_members(&self, room: &RoomId) -> Option<Vec<ConnectionId>> {
+        self.rooms.get(room).map(|e| {
+            Metrics::add(&e.messages, 1);
+            e.members.iter().copied().collect()
+        })
     }
 
     /// Membership size without copying (diagnostics/tests).
     pub fn member_count(&self, room: &RoomId) -> usize {
-        self.rooms.get(room).map_or(0, |set| set.len())
+        self.rooms.get(room).map_or(0, |e| e.members.len())
+    }
+
+    /// `room().info()` (Phase 2A): `(members, messages, exists)`.
+    pub fn info(&self, room: &RoomId) -> RoomStat {
+        match self.rooms.get(room) {
+            Some(e) => RoomStat {
+                room: room.0.clone(),
+                members: e.members.len(),
+                messages: Metrics::get(&e.messages),
+            },
+            None => RoomStat {
+                room: room.0.clone(),
+                members: 0,
+                messages: 0,
+            },
+        }
+    }
+
+    /// `topRooms(n)` (Phase 2A): the n rooms with the most members (ties by
+    /// message count, then name), highest first. Bounded output; copy-out
+    /// discipline — each entry is read under its own shard lock (via `iter`),
+    /// the bounded top-N heap is held OUTSIDE any lock, and no two shard locks
+    /// are ever held at once (§12 rules 2/3). `n == 0` yields an empty vec (the
+    /// binding rejects non-positive requests and clamps above the cap).
+    pub fn top_rooms(&self, n: usize) -> Vec<RoomStat> {
+        if n == 0 {
+            return Vec::new();
+        }
+        // A min-heap of the current top-N: push, then evict the lowest-ranked
+        // once over capacity — never more than n+1 entries retained.
+        let mut heap: BinaryHeap<Reverse<RoomStat>> = BinaryHeap::with_capacity(n + 1);
+        for entry in self.rooms.iter() {
+            let stat = RoomStat {
+                room: entry.key().0.clone(),
+                members: entry.value().members.len(),
+                messages: Metrics::get(&entry.value().messages),
+            };
+            heap.push(Reverse(stat));
+            if heap.len() > n {
+                heap.pop(); // drop the lowest-ranked of the kept set
+            }
+        }
+        let mut out: Vec<RoomStat> = heap.into_iter().map(|Reverse(s)| s).collect();
+        out.sort_by(|a, b| b.cmp(a)); // highest rank first
+        out
     }
 
     /// Join `id` to `room`. Runs under the connection's shard lock
@@ -93,8 +188,8 @@ impl RoomRegistry {
                 return MembershipChange::LimitExceeded;
             }
             set.insert(room.clone());
-            // Auto-create on first join.
-            self.rooms.entry(room).or_default().insert(id);
+            // Auto-create on first join (fresh RoomEntry: empty set, 0 counter).
+            self.rooms.entry(room).or_default().members.insert(id);
             MembershipChange::Changed
         }) {
             Some(change) => change,
@@ -126,15 +221,17 @@ impl RoomRegistry {
         }
     }
 
-    /// Remove one member; auto-destroy the room when it empties.
+    /// Remove one member; auto-destroy the room when it empties. Destroying the
+    /// entry also drops its message counter — an idle room costs nothing, and a
+    /// re-created room starts its counter fresh (documented behavior).
     fn remove_member(&self, room: &RoomId, id: ConnectionId) {
-        if let Some(mut set) = self.rooms.get_mut(room) {
-            set.remove(&id);
-            if set.is_empty() {
-                drop(set); // release the entry guard before removal
-                           // remove_if re-checks emptiness under the map lock, so a
-                           // concurrent join between drop and here is not lost.
-                self.rooms.remove_if(room, |_, set| set.is_empty());
+        if let Some(mut e) = self.rooms.get_mut(room) {
+            e.members.remove(&id);
+            if e.members.is_empty() {
+                drop(e); // release the entry guard before removal
+                         // remove_if re-checks emptiness under the map lock, so a
+                         // concurrent join between drop and here is not lost.
+                self.rooms.remove_if(room, |_, e| e.members.is_empty());
             }
         }
     }

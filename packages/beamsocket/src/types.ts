@@ -53,12 +53,20 @@ export interface AuthorizeConfig {
   maxPending?: number;
 }
 
+/** Observability (Phase 2A). The sampler derives rates from existing counters. */
+export interface ObservabilityConfig {
+  /** Rate-sampler interval, ms. Default 1000 (1 Hz). 0 disables it — then
+   * `stats().rates` is `null`. */
+  samplerMs?: number;
+}
+
 export interface BeamSocketConfig {
   limits?: Limits;
   backpressure?: Backpressure;
   keepalive?: Keepalive;
   trustProxy?: TrustProxy;
   authorize?: AuthorizeConfig;
+  observability?: ObservabilityConfig;
   /**
    * Attach to an existing Node `http.Server` (Phase 1.1, RFC 0002) instead of
    * owning a port. Mutually exclusive with `listen()`. Plaintext `http.Server`
@@ -173,6 +181,82 @@ export interface PresenceEntry {
   id: string;
   userId?: string;
   metadata?: Record<string, unknown>;
+}
+
+// ── Phase 2A observability read surface ──
+
+/** EWMA rate, one value per window. */
+export interface Rate {
+  perSec1s: number;
+  perSec10s: number;
+}
+
+/** Derived rates (Phase 2A) — only present when the sampler is enabled. */
+export interface Rates {
+  messagesIn: Rate;
+  messagesOut: Rate;
+  bytesIn: Rate;
+  bytesOut: Rate;
+}
+
+/** `io.stats()` — the full runtime snapshot: every `Metrics` field plus uptime
+ * and the sampler rates (Phase 2A). One FFI call. */
+export interface Stats extends Metrics {
+  uptimeMs: number;
+  /** `null` when the sampler is disabled (`observability.samplerMs: 0`). */
+  rates: Rates | null;
+}
+
+/** One row of `io.topRooms()`. */
+export interface RoomStat {
+  room: string;
+  members: number;
+  /** Cumulative messages broadcast to this room since it was (re)created. */
+  messages: number;
+}
+
+/** `io.room(id).info()` — a `RoomStat` plus existence (an empty room can't
+ * survive, so `exists` is `members > 0`). */
+export interface RoomInfo extends RoomStat {
+  exists: boolean;
+}
+
+/** `io.memoryUsage()` — a structural model (× live counts) + measured mailbox
+ * bytes-in-flight. `estimated` is always true (the heap figure is a model). */
+export interface MemoryUsage {
+  connections: number;
+  rooms: number;
+  users: number;
+  estimatedHeapBytes: number;
+  mailboxBytesInFlight: number;
+  estimated: true;
+}
+
+/** One mailbox in `io.backpressureReport()`. */
+export interface BackpressureMailbox {
+  socketId: string;
+  userId?: string;
+  depthBytes: number;
+  hwmBytes: number;
+  hwmPercent: number;
+}
+
+/** `io.backpressureReport({ topN })`. Per-connection drop attribution is
+ * deferred; `totalDrops` is the global count. */
+export interface BackpressureReport {
+  totalDrops: number;
+  mailboxes: BackpressureMailbox[];
+}
+
+/** `io.user(id)` — query handle for a user (Phase 2A). */
+export interface UserHandle {
+  /** The user's live device socket ids (the 1C identity promise). */
+  connections(): string[];
+}
+
+/** `io.room(id)` — query handle for a room (Phase 2A). */
+export interface RoomHandle {
+  info(): RoomInfo;
 }
 
 export interface CloseOptions {
