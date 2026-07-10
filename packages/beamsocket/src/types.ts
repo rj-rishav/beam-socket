@@ -138,9 +138,9 @@ export type RejectCode = (typeof RejectCode)[keyof typeof RejectCode];
 // ── Phase 2B admin actions (§12.2) ──
 
 /**
- * Close codes the admin verbs may deliver (Phase 2B — DoD requires the codes
- * named in the types). `disconnectSocket`/`disconnectUser` send a real close
- * frame with this code; `closeRoom` never sends one (it is disconnect-free).
+ * Close codes the admin disconnect verbs deliver (Phase 2B — DoD requires the
+ * codes named in the types). `disconnectSocket`/`disconnectUser` send a real
+ * close frame with this code; `closeRoom` is disconnect-free and takes no code.
  *
  * Allowed values: `NORMAL` (1000, the default) or the application range
  * 4000–4999 (`APP_RANGE_MIN`–`APP_RANGE_MAX`, e.g. 4001 "kicked", 4008

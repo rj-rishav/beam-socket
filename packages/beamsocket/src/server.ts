@@ -367,12 +367,12 @@ export class BeamSocket extends EventEmitter {
 
   /**
    * Destroy a room by removing every member (Phase 2B). Disconnect-free: the
-   * members' connections stay alive; no close frame is sent, so `code` is
-   * accepted for signature symmetry with the other verbs (and validated) but
-   * has no wire effect. Returns how many memberships were removed.
+   * members' connections stay alive and no close frame is sent — which is why,
+   * unlike the disconnect verbs, this takes no close code (a parameter with no
+   * wire effect is a footgun, not symmetry). Returns how many memberships were
+   * removed.
    */
-  closeRoom(room: string, code?: number): AdminCloseRoomResult {
-    adminCode(code); // validated for symmetry; closeRoom sends no close frame
+  closeRoom(room: string): AdminCloseRoomResult {
     const engine = this.#adminEngine('closeRoom');
     if (!engine) return { removed: 0 };
     return { removed: engine.closeRoom(room) };

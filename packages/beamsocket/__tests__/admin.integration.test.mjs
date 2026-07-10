@@ -149,8 +149,8 @@ test('code validation: only 1000 and 4000-4999 pass; anything else throws RangeE
   for (const bad of [999, 1001, 1006, 3999, 5000, 4000.5, NaN]) {
     assert.throws(() => io.disconnectSocket(socket.id, bad), RangeError, `code ${bad}`);
     assert.throws(() => io.disconnectUser('carl', bad), RangeError, `code ${bad}`);
-    assert.throws(() => io.closeRoom('lobby', bad), RangeError, `code ${bad}`);
   }
+  // closeRoom takes no code — a disconnect-free verb has no wire code to send.
   // The throws happened before any close was initiated.
   assert.equal(io.connectionCount(), 1);
   assert.equal(io.stats().adminDisconnects, 0);
