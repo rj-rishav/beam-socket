@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
 
 import type {
+  AdminCloseRoomResult,
+  AdminDisconnectResult,
   AuthorizeRequest,
   AuthorizeResult,
   BackpressureReport,
@@ -13,7 +15,7 @@ import type {
   Stats,
   UserHandle,
 } from './types.js';
-import { RejectCode } from './types.js';
+import { AdminCloseCode, RejectCode } from './types.js';
 import { BoundedMetaMap } from './correlation.js';
 import { demux } from './events.js';
 import { decodeSocketId, encodeSocketId } from './ids.js';
@@ -60,6 +62,26 @@ const WINDOWS_ATTACH_MSG =
   'BeamSocket cannot attach to an HTTP server on Windows yet (fd handoff needs WSADuplicateSocket, not shipped in 1.1). Run BeamSocket on its own port with listen() alongside your HTTP server, behind the same load balancer.';
 const LISTEN_MUTEX_MSG =
   'listen() is invalid when constructed with { server } — the HTTP server owns the port';
+
+/**
+ * Validate an admin close code (Phase 2B): 1000 (default) or the 4000–4999
+ * application range. Throws BEFORE any FFI call — the other registered codes
+ * belong to the engine/RFC 6455 and would lie to the client (types.ts
+ * `AdminCloseCode`).
+ */
+function adminCode(code: number | undefined): number {
+  const c = code ?? AdminCloseCode.NORMAL;
+  if (
+    !Number.isInteger(c) ||
+    (c !== AdminCloseCode.NORMAL &&
+      (c < AdminCloseCode.APP_RANGE_MIN || c > AdminCloseCode.APP_RANGE_MAX))
+  ) {
+    throw new RangeError(
+      `admin close code must be 1000 or in the application range 4000-4999, got ${c}`,
+    );
+  }
+  return c;
+}
 
 /** The request path without query (for `path` claim routing). */
 function pathnameOf(url: string | undefined): string {
@@ -209,6 +231,8 @@ export class BeamSocket extends EventEmitter {
       authorizeRejected: s.authorizeRejected,
       authorizeTimedOut: s.authorizeTimedOut,
       pendingOverflow: s.pendingOverflow,
+      adminDisconnects: s.adminDisconnects,
+      adminRoomCloses: s.adminRoomCloses,
       // JS-owned counter (the correlation map lives here, not in Rust).
       authMetadataEvicted: this.#pendingAuth.evicted,
     };
@@ -305,6 +329,61 @@ export class BeamSocket extends EventEmitter {
         return { room: s.room, members: s.members, messages: s.messages, exists: s.exists };
       },
     };
+  }
+
+  // ── Phase 2B: admin actions (§12.2). One FFI call each; the sweep runs in
+  // Rust over the EXISTING close/cleanup paths (no new teardown logic). While
+  // a graceful close() is draining, each verb is a safe no-op reporting 0 —
+  // same answer as a nonexistent target — instead of a throw: an operator
+  // script racing shutdown should not crash. Before the server ever started,
+  // they fail loudly like every other verb. ──
+
+  /**
+   * Close one connection (Phase 2B). `code` defaults to 1000; the 4000–4999
+   * application range is allowed (any other code throws a RangeError). Full
+   * 1C/1D cleanup — rooms, identity, presence, metrics — runs in Rust on the
+   * same path as `socket.close()`.
+   */
+  disconnectSocket(socketId: string, code?: number): AdminDisconnectResult {
+    const c = adminCode(code);
+    const engine = this.#adminEngine('disconnectSocket');
+    if (!engine) return { closed: 0 };
+    const parsed = decodeSocketId(socketId);
+    if (!parsed) return { closed: 0 }; // never one of ours → same as stale
+    return { closed: engine.disconnectSocket(parsed.hi, parsed.lo, c) };
+  }
+
+  /**
+   * Close every device of one user (Phase 2B). Same code rules as
+   * `disconnectSocket`. The identity entry is gone once the last device's
+   * close completes (the 1C invariant). Returns how many devices were closed.
+   */
+  disconnectUser(userId: string, code?: number): AdminDisconnectResult {
+    const c = adminCode(code);
+    const engine = this.#adminEngine('disconnectUser');
+    if (!engine) return { closed: 0 };
+    return { closed: engine.disconnectUser(userId, c) };
+  }
+
+  /**
+   * Destroy a room by removing every member (Phase 2B). Disconnect-free: the
+   * members' connections stay alive; no close frame is sent, so `code` is
+   * accepted for signature symmetry with the other verbs (and validated) but
+   * has no wire effect. Returns how many memberships were removed.
+   */
+  closeRoom(room: string, code?: number): AdminCloseRoomResult {
+    adminCode(code); // validated for symmetry; closeRoom sends no close frame
+    const engine = this.#adminEngine('closeRoom');
+    if (!engine) return { removed: 0 };
+    return { removed: engine.closeRoom(room) };
+  }
+
+  /** Engine for an admin verb: null while draining (safe no-op), throw when
+   * the server never started (an operator typo should fail loudly). */
+  #adminEngine(method: string): NativeEngine | null {
+    if (this.#engine) return this.#engine;
+    if (this.#closing) return null; // close() drain in progress/complete
+    throw new Error(`io.${method}() requires a running server — call listen() first`);
   }
 
   /**

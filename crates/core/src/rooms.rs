@@ -212,6 +212,28 @@ impl RoomRegistry {
         }
     }
 
+    /// `closeRoom` sweep (Phase 2B §12.2): copy the members out (room guard
+    /// released before any conn shard is touched — the 1B discipline), then
+    /// run the EXISTING `leave` path per member. The last leave auto-destroys
+    /// the room — no new teardown logic, by design: the sweep is literally
+    /// `members()` + `leave()` in a loop. Connections stay alive.
+    ///
+    /// Returns `Some(removed)` (memberships actually removed), or `None` when
+    /// the room doesn't exist. A member that disconnects between the copy-out
+    /// and its leave is a benign `NotFound`/`NoOp` (not counted); a join that
+    /// races the sweep may keep the room alive with the new member — the room
+    /// was closed as of the snapshot, which is all a sweep can promise.
+    pub fn close_room(&self, conns: &Registry, room: &RoomId) -> Option<usize> {
+        let members = self.members(room)?;
+        let mut removed = 0;
+        for id in members {
+            if self.leave(conns, id, room) == MembershipChange::Changed {
+                removed += 1;
+            }
+        }
+        Some(removed)
+    }
+
     /// O(rooms of the connection) cleanup with the set taken out of the
     /// registry by `remove_full` — the entry is already gone, so no new join
     /// for this id can race the sweep.

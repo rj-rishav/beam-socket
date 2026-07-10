@@ -17,6 +17,16 @@ test('API surface', async () => {
   // Phase 1D targeting/queries also require a running server.
   assert.throws(() => io.metrics(), /listen\(\)/);
   assert.throws(() => io.presence('lobby'), /listen\(\)/);
+  // Phase 2B admin verbs exist and fail loudly before listen() (a server that
+  // never started is an operator typo, not a drain — server.ts #adminEngine).
+  for (const m of ['disconnectSocket', 'disconnectUser', 'closeRoom']) {
+    assert.equal(typeof io[m], 'function', `io.${m} missing`);
+  }
+  assert.throws(() => io.disconnectSocket('x-y'), /listen\(\)/);
+  assert.throws(() => io.disconnectUser('u1'), /listen\(\)/);
+  assert.throws(() => io.closeRoom('lobby'), /listen\(\)/);
+  // Code validation runs BEFORE the engine check (never a partial effect).
+  assert.throws(() => io.disconnectSocket('x-y', 1006), RangeError);
   // authorize() is chainable and registered before listen() (Phase 1C).
   assert.equal(
     io.authorize(() => ({ accept: true })),
