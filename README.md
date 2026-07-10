@@ -10,8 +10,11 @@ attach), all gates closed in sequence; 60 Rust + 26 JS tests green on the merged
 tree. Connections, rooms, users, and admission control all run in Rust; the
 whole per-message data plane stays off the JS event loop. Phase 0 gate met: RFC
 0001 [results](docs/rfcs/0001-results.md) — Design C graduated. **Phase 2
-(runtime maturity / observability) is in progress** — see
-[ENGINEERING.md §12](docs/ENGINEERING.md).
+(runtime maturity) is complete and merged**: the full observability read surface
+(`stats`, `topRooms`, `backpressureReport`, `memoryUsage`, Prometheus export —
+zero hot-path cost, proven) plus the admin verbs (`disconnectSocket`,
+`disconnectUser`, `closeRoom`). Next: Phase 3 (cluster mesh) opens with RFC 0004
+— see [ENGINEERING.md §12](docs/ENGINEERING.md).
 
 **Release blockers before the alpha goes public** (need real hardware /
 credentials, not closable in a sandbox): pinned-box bridge-constant

@@ -45,8 +45,9 @@ Every PR is reviewed against these five rules. They come from ARCHITECTURE.md §
 | **1C** | Identity + admission limits | Multi-device `toUser` works; spoofed XFF test passes | ✅ merged |
 | **1D** | Presence, metrics, graceful close | 10-min soak clean → publish `0.1.0-alpha` | ✅ merged (publish rides the release blockers) |
 | **1.1** | Attach to existing HTTP server | RFC 0002 written first, then Express/Fastify example | ✅ merged (macOS row CI-gated) |
-| **2A** | Observability read surface | §12 gates: stats/topRooms/backpressureReport + zero-hot-path-cost proof | current |
-| **2B** | Admin actions | §12 gates: disconnect verbs + identity/room cleanup proofs | after 2A |
+| **2A** | Observability read surface | §12 gates: stats/topRooms/backpressureReport + zero-hot-path-cost proof | ✅ merged (perf guard ON≈OFF) |
+| **2B** | Admin actions | §12 gates: disconnect verbs + identity/room cleanup proofs | ✅ merged (zero new teardown held) |
+| **3** | Cluster mesh | Starts with an RFC (0004), not a branch | next — RFC first |
 
 Phases are strictly sequential. **Do not start a phase while the previous phase's exit gate is open.**
 
