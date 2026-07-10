@@ -48,6 +48,9 @@ enum Op {
     Join(u8, u8),
     Leave(u8, u8),
     Disconnect(u8),
+    /// Phase 2B (§12.2): the `closeRoom` sweep, extended into this model so the
+    /// bidirectional-views invariant is proven WITH the admin verb in the mix.
+    CloseRoom(u8),
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -55,6 +58,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         (0..8u8, 0..5u8).prop_map(|(c, r)| Op::Join(c, r)),
         (0..8u8, 0..5u8).prop_map(|(c, r)| Op::Leave(c, r)),
         (0..8u8).prop_map(Op::Disconnect),
+        (0..5u8).prop_map(Op::CloseRoom),
     ]
 }
 
@@ -90,6 +94,20 @@ proptest! {
                     if let Some(id) = ids[c as usize].take() {
                         let (_, joined) = conns.remove_full(id).expect("live conn");
                         rooms.disconnect_cleanup(id, joined);
+                    }
+                }
+                Op::CloseRoom(r) => {
+                    let rid = room(r);
+                    let existed = rooms.members(&rid).is_some();
+                    let removed = rooms.close_room(&conns, &rid);
+                    // None ⇔ the room didn't exist; a swept room is GONE.
+                    prop_assert_eq!(removed.is_some(), existed);
+                    if existed {
+                        prop_assert!(
+                            rooms.members(&rid).is_none(),
+                            "closeRoom left room {:?} alive",
+                            rid
+                        );
                     }
                 }
             }

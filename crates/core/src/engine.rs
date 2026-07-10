@@ -680,6 +680,18 @@ impl Engine {
             "Handshakes shed because the pending-upgrade table was full.",
             Metrics::get(&m.pending_overflow),
         );
+        counter(
+            &mut s,
+            "beamsocket_admin_disconnects_total",
+            "Connections closed by disconnectSocket/disconnectUser.",
+            Metrics::get(&m.admin_disconnects),
+        );
+        counter(
+            &mut s,
+            "beamsocket_admin_room_closes_total",
+            "Rooms closed by closeRoom.",
+            Metrics::get(&m.admin_room_closes),
+        );
         let _ = writeln!(
             s,
             "# HELP beamsocket_bridge_pressure Rust-to-JS bridge saturation (0..1).\n# TYPE beamsocket_bridge_pressure gauge\nbeamsocket_bridge_pressure {}",
@@ -723,6 +735,70 @@ impl Engine {
             );
         }
         s
+    }
+
+    // ── Phase 2B: admin actions (§12.2). Control-plane sweeps — each is one
+    // FFI call from JS, and each only CALLS the paths the earlier phases
+    // proved: `initiate_close` → connection-task exit → `remove_full` →
+    // `disconnect_cleanup` → `unbind` for the disconnect verbs, and the
+    // `members()`-copy-out + `leave` loop for `closeRoom`. Zero new teardown
+    // logic (the §12.2 smell rule); zero new per-connection state (Rule 4). ──
+
+    /// `io.disconnectSocket(id, code?)` — close one connection through the
+    /// EXISTING server-initiated close path (identical to `close_connection`,
+    /// which the churn tests already prove leak-free: rooms, identity,
+    /// presence, and metrics all unwind in the connection task's tail).
+    /// Returns how many connections were closed (0 = unknown/stale id, 1 = hit).
+    pub fn admin_disconnect_socket(&self, id: ConnectionId, code: u16) -> u64 {
+        match self.registry.get(id) {
+            Some(handle) => {
+                handle.initiate_close(code, "admin disconnect", true);
+                Metrics::add(&self.metrics.admin_disconnects, 1);
+                1
+            }
+            None => 0,
+        }
+    }
+
+    /// `io.disconnectUser(userId, code?)` — close every device of one user.
+    /// The device set is COPIED OUT of the identity shard first (1B copy-out
+    /// discipline: the shard guard is released before any close is initiated,
+    /// so the sweep never holds the user shard while touching a conn shard).
+    /// Each close is the same existing path as `admin_disconnect_socket`; the
+    /// identity entry auto-destroys when its last device unbinds in the
+    /// connection task's tail — the 1C invariant, now reachable via admin.
+    /// Returns how many devices were closed (0 = unknown/offline user).
+    pub fn admin_disconnect_user(&self, user_id: &str, code: u16) -> u64 {
+        // Copy-out: the guard inside `connections` is gone before this returns.
+        let devices = self
+            .identity
+            .connections(&UserId(user_id.to_owned()))
+            .unwrap_or_default();
+        let mut closed = 0u64;
+        for id in devices {
+            if let Some(handle) = self.registry.get(id) {
+                handle.initiate_close(code, "admin disconnect", true);
+                closed += 1;
+            }
+        }
+        Metrics::add(&self.metrics.admin_disconnects, closed);
+        closed
+    }
+
+    /// `io.closeRoom(room)` — remove every member (existing `leave` path; the
+    /// last leave auto-destroys the room), disconnect-free: connections stay
+    /// alive. Returns how many memberships were removed (0 = no such room).
+    pub fn admin_close_room(&self, room: &str) -> u64 {
+        match self
+            .rooms
+            .close_room(&self.registry, &RoomId(room.to_owned()))
+        {
+            Some(removed) => {
+                Metrics::add(&self.metrics.admin_room_closes, 1);
+                removed as u64
+            }
+            None => 0,
+        }
     }
 
     /// Bridge back-pressure gauge (`metrics().bridgePressure`), 0.0..=1.0.
