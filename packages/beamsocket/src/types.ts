@@ -135,6 +135,43 @@ export const RejectCode = {
 
 export type RejectCode = (typeof RejectCode)[keyof typeof RejectCode];
 
+// ── Phase 2B admin actions (§12.2) ──
+
+/**
+ * Close codes the admin disconnect verbs deliver (Phase 2B — DoD requires the
+ * codes named in the types). `disconnectSocket`/`disconnectUser` send a real
+ * close frame with this code; `closeRoom` is disconnect-free and takes no code.
+ *
+ * Allowed values: `NORMAL` (1000, the default) or the application range
+ * 4000–4999 (`APP_RANGE_MIN`–`APP_RANGE_MAX`, e.g. 4001 "kicked", 4008
+ * "banned" — the meaning within the range is the application's). Anything
+ * else throws a `RangeError` before any FFI call: the remaining registered
+ * codes (1001–1015) belong to the engine/RFC 6455 and would lie to the client
+ * about what happened.
+ */
+export const AdminCloseCode = {
+  /** Default for `disconnectSocket`/`disconnectUser` — normal closure. */
+  NORMAL: 1000,
+  /** Start of the application-defined range admin verbs may use. */
+  APP_RANGE_MIN: 4000,
+  /** End of the application-defined range admin verbs may use. */
+  APP_RANGE_MAX: 4999,
+} as const;
+
+/** Result of `io.disconnectSocket()` / `io.disconnectUser()`: how many
+ * connections had their close initiated (0 = unknown/stale target, or the
+ * server is draining — admin verbs during `close()` are safe no-ops). */
+export interface AdminDisconnectResult {
+  closed: number;
+}
+
+/** Result of `io.closeRoom()`: how many memberships were removed before the
+ * room auto-destroyed (0 = no such room, or the server is draining). The
+ * members' connections stay alive. */
+export interface AdminCloseRoomResult {
+  removed: number;
+}
+
 /**
  * One-FFI-call snapshot from lock-free Rust atomics (Phase 1D). Every field is
  * named here — there are no undocumented counters. Per-connection metrics cost
@@ -175,6 +212,13 @@ export interface Metrics {
    * accepted connections opened with `{}` metadata; identity is unaffected.
    */
   authMetadataEvicted: number;
+  /** Connections closed by `disconnectSocket`/`disconnectUser` (one per
+   * connection actually closed — a 3-device `disconnectUser` counts 3).
+   * (Phase 2B) */
+  adminDisconnects: number;
+  /** Rooms closed by `closeRoom` (one per call that found the room).
+   * (Phase 2B) */
+  adminRoomCloses: number;
 }
 
 export interface PresenceEntry {

@@ -42,6 +42,9 @@ export interface NativeStats {
   authorizeRejected: number;
   authorizeTimedOut: number;
   pendingOverflow: number;
+  // Phase 2B
+  adminDisconnects: number;
+  adminRoomCloses: number;
   // Phase 2A
   uptimeMs: number;
   rates: NativeRates | null;
@@ -165,6 +168,11 @@ export interface NativeEngine {
   /** Flat [hi0, lo0, hi1, lo1, …] device id pairs. */
   userConnections(userId: string): Uint32Array;
   metricsText(): string;
+  // Phase 2B — admin actions (one FFI call each; sweeps run in Rust). Each
+  // returns a count and is a safe 0-returning no-op while draining/shut down.
+  disconnectSocket(idHi: number, idLo: number, code: number): number;
+  disconnectUser(userId: string, code: number): number;
+  closeRoom(room: string): number;
   // Phase 1.1 — HTTP attach (Unix only; the SDK throws on Windows before here).
   // `headersFlat` is [k0,v0,k1,v1,…] (e.g. req.rawHeaders).
   attach(
