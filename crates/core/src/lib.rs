@@ -21,4 +21,5 @@ pub mod limits;
 pub mod metrics;
 pub mod presence;
 pub mod rooms;
+pub mod sampler;
 pub mod transport;

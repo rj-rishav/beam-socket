@@ -175,6 +175,25 @@ impl Registry {
         }
         out
     }
+
+    /// Snapshot of `(id, handle, userId)` per live connection (Phase 2A
+    /// `backpressureReport`). Same copy-out discipline as `handles`: everything
+    /// is cloned under the shard lock, so the caller reads mailbox depth OUTSIDE
+    /// any lock and holds no shard lock while touching another.
+    pub fn handles_with_user(&self) -> Vec<(ConnectionId, ConnHandle, Option<UserId>)> {
+        let mut out = Vec::new();
+        for (si, shard) in self.shards.iter().enumerate() {
+            let shard = shard.lock().unwrap();
+            for (key, entry) in shard.slab.iter() {
+                out.push((
+                    ConnectionId::new(si as u8, entry.generation, key as u32),
+                    entry.handle.clone(),
+                    entry.user.clone(),
+                ));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

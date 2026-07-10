@@ -4,9 +4,11 @@
 //!
 //! Build spec: docs/ENGINEERING.md §5.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -26,9 +28,10 @@ use crate::limits::{
     header_value, AdmittedUpgrade, ClientIpResolver, Gate, IpLimiter, HTTP_SERVICE_UNAVAILABLE,
     HTTP_TOO_MANY_REQUESTS,
 };
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, Rates};
 use crate::presence::{LocalPresence, PresenceEntry, PresenceStore};
-use crate::rooms::{MembershipChange, RoomRegistry};
+use crate::rooms::{MembershipChange, RoomRegistry, RoomStat};
+use crate::sampler;
 use crate::transport::{Accepted, FrameSink, FrameSource, OutFrame, Transport, WebSocketTransport};
 
 #[derive(Debug)]
@@ -93,6 +96,71 @@ pub enum AttachOutcome {
     Rejected(u16),
 }
 
+/// One mailbox in `backpressureReport` (Phase 2A) — a connection ranked by its
+/// queued send-buffer depth. Reads only EXISTING per-connection gauges (the
+/// mailbox depth) + config (HWM) + registry (id, userId) — no new state.
+#[derive(Debug, Clone)]
+pub struct MailboxStat {
+    pub id: ConnectionId,
+    pub user: Option<UserId>,
+    pub depth_bytes: usize,
+    pub hwm_bytes: usize,
+    pub hwm_percent: f64,
+}
+
+/// `backpressureReport` envelope (Phase 2A). Per-CONNECTION drop attribution is
+/// deferred — it would be new per-conn state (§12.1 "no new state" / Rule 4);
+/// the drop TOTAL (already counted globally) is reported here instead.
+#[derive(Debug, Clone)]
+pub struct BackpressureReport {
+    pub total_drops: u64,
+    pub mailboxes: Vec<MailboxStat>,
+}
+
+/// `memoryUsage` (Phase 2A). `estimated_heap_bytes` is a structural MODEL (the
+/// 1D memory-budget table × live counts); `mailbox_bytes_in_flight` is MEASURED
+/// (summed live queue depths). `estimated` is always true — a model is never
+/// presented as a measurement.
+#[derive(Debug, Clone)]
+pub struct MemoryUsage {
+    pub connections: u64,
+    pub rooms: u64,
+    pub users: u64,
+    pub estimated_heap_bytes: u64,
+    pub mailbox_bytes_in_flight: u64,
+    pub estimated: bool,
+}
+
+// Structural model constants (benchmarks/README §"Memory budget per idle
+// connection", Phase 1D). Rust-heap only — kernel socket buffers and the JS
+// Socket proxy are not counted here.
+const MODEL_CONN_BYTES: u64 = 6600; // engine bookkeeping ~2.5 KB + 4 KB codec read buffer
+const MODEL_ROOM_BYTES: u64 = 160; // DashMap entry + HashSet + RoomId + 8 B counter
+const MODEL_USER_BYTES: u64 = 40; // amortized identity index entry (1C ~20 B/device)
+
+/// Orders a `MailboxStat` by depth (then id ASC) so a bounded min-heap keeps the
+/// deepest N. f64 fields are excluded from the order (not `Eq`).
+struct ByDepth(MailboxStat);
+impl PartialEq for ByDepth {
+    fn eq(&self, o: &Self) -> bool {
+        self.0.depth_bytes == o.0.depth_bytes && self.0.id.0 == o.0.id.0
+    }
+}
+impl Eq for ByDepth {}
+impl Ord for ByDepth {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.0
+            .depth_bytes
+            .cmp(&o.0.depth_bytes)
+            .then(o.0.id.0.cmp(&self.0.id.0)) // smaller id ranks higher
+    }
+}
+impl PartialOrd for ByDepth {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
 pub struct Engine {
     runtime: Option<tokio::runtime::Runtime>,
     registry: Arc<Registry>,
@@ -106,6 +174,11 @@ pub struct Engine {
     /// Present only when the SDK registered an `authorize` hook. `None` = accept
     /// all, no round-trip to JS, userId unbound (1A/1B behavior).
     authorizer: Option<Arc<Authorizer>>,
+    /// When the engine booted — backs `stats().uptimeMs` (Phase 2A).
+    started_at: Instant,
+    /// EWMA rates, updated by the sampler task. `None` when the sampler is
+    /// disabled (`observability.sampler_ms == 0`) — then `stats().rates` is absent.
+    rates: Option<Arc<Rates>>,
     shutdown_tx: watch::Sender<bool>,
     listening: Mutex<bool>,
 }
@@ -147,6 +220,19 @@ impl Engine {
             ))
         });
 
+        // Phase 2A: spawn the 1 Hz rate sampler (the only new task). It reads the
+        // existing counters and writes `Rates` — never the message path.
+        // `sampler_ms == 0` disables it: no task, no rates.
+        let rates = (config.observability.sampler_ms > 0).then(|| {
+            let rates = Arc::new(Rates::default());
+            runtime.spawn(sampler::run(
+                metrics.clone(),
+                rates.clone(),
+                Duration::from_millis(config.observability.sampler_ms),
+            ));
+            rates
+        });
+
         Ok((
             Self {
                 runtime: Some(runtime),
@@ -158,11 +244,23 @@ impl Engine {
                 config: Arc::new(config),
                 gate,
                 authorizer,
+                started_at: Instant::now(),
+                rates,
                 shutdown_tx,
                 listening: Mutex::new(false),
             },
             rx,
         ))
+    }
+
+    /// Milliseconds since the engine booted (`stats().uptimeMs`, Phase 2A).
+    pub fn uptime_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// The live EWMA rates, or `None` when the sampler is disabled (Phase 2A).
+    pub fn rates(&self) -> Option<&Rates> {
+        self.rates.as_deref()
     }
 
     /// A handle for driving async work from foreign threads (the bridge's
@@ -400,6 +498,231 @@ impl Engine {
 
     pub fn room_count(&self) -> usize {
         self.rooms.room_count()
+    }
+
+    /// `topRooms(n)` — the n most-populated rooms (Phase 2A). Bounded output,
+    /// copy-out discipline (rooms.rs). `n` is validated/clamped by the caller.
+    pub fn top_rooms(&self, n: usize) -> Vec<RoomStat> {
+        self.rooms.top_rooms(n)
+    }
+
+    /// `room(id).info()` — member + message counts (Phase 2A). Missing room →
+    /// zeroes.
+    pub fn room_info(&self, room: &str) -> RoomStat {
+        self.rooms.info(&RoomId(room.to_owned()))
+    }
+
+    /// `backpressureReport({topN})` — the `top_n` deepest send queues, with
+    /// depth/HWM%/socketId/userId, plus the global drop total (Phase 2A).
+    /// Bounded output; copy-out discipline (registry snapshot, depth read
+    /// outside any lock). `top_n` is validated/clamped by the caller.
+    pub fn backpressure_report(&self, top_n: usize) -> BackpressureReport {
+        let hwm = self.config.backpressure.high_water_mark;
+        let total_drops = Metrics::get(&self.metrics.backpressure_drops);
+        let mut mailboxes = Vec::new();
+        if top_n > 0 {
+            let mut heap: BinaryHeap<Reverse<ByDepth>> = BinaryHeap::with_capacity(top_n + 1);
+            for (id, handle, user) in self.registry.handles_with_user() {
+                let depth = handle.mailbox.queued_bytes();
+                let stat = MailboxStat {
+                    id,
+                    user,
+                    depth_bytes: depth,
+                    hwm_bytes: hwm,
+                    hwm_percent: if hwm > 0 {
+                        depth as f64 / hwm as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                };
+                heap.push(Reverse(ByDepth(stat)));
+                if heap.len() > top_n {
+                    heap.pop();
+                }
+            }
+            mailboxes = heap.into_iter().map(|Reverse(ByDepth(s))| s).collect();
+            mailboxes.sort_by(|a, b| b.depth_bytes.cmp(&a.depth_bytes).then(a.id.0.cmp(&b.id.0)));
+        }
+        BackpressureReport {
+            total_drops,
+            mailboxes,
+        }
+    }
+
+    /// `memoryUsage()` — structural heap model + measured mailbox bytes-in-flight
+    /// (Phase 2A). The model is labeled `estimated: true`.
+    pub fn memory_usage(&self) -> MemoryUsage {
+        let connections = self.connection_count();
+        let rooms = self.room_count() as u64;
+        let users = self.user_count();
+        let mailbox_bytes_in_flight: u64 = self
+            .registry
+            .handles()
+            .iter()
+            .map(|(_, h)| h.mailbox.queued_bytes() as u64)
+            .sum();
+        MemoryUsage {
+            connections,
+            rooms,
+            users,
+            estimated_heap_bytes: connections * MODEL_CONN_BYTES
+                + rooms * MODEL_ROOM_BYTES
+                + users * MODEL_USER_BYTES,
+            mailbox_bytes_in_flight,
+            estimated: true,
+        }
+    }
+
+    /// `user(id).connections()` — the live device ids of a user (Phase 2A; the
+    /// 1C identity promise). Empty for an unknown/offline user.
+    pub fn user_connections(&self, user_id: &str) -> Vec<ConnectionId> {
+        self.identity
+            .connections(&UserId(user_id.to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// `metricsText()` — Prometheus text exposition of the counters + rates
+    /// (Phase 2A, the ARCHITECTURE §2.1 promise). Reads the same atomics as
+    /// `stats()`; builds a string, touches nothing per-message.
+    pub fn metrics_text(&self) -> String {
+        use std::fmt::Write;
+        let m = &self.metrics;
+        let mut s = String::new();
+
+        let gauge = |s: &mut String, name: &str, help: &str, v: u64| {
+            let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
+        };
+        let counter = |s: &mut String, name: &str, help: &str, v: u64| {
+            let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}");
+        };
+
+        gauge(
+            &mut s,
+            "beamsocket_connections",
+            "Currently open connections.",
+            Metrics::get(&m.connections),
+        );
+        gauge(
+            &mut s,
+            "beamsocket_users",
+            "Distinct users with at least one live connection.",
+            self.user_count(),
+        );
+        gauge(
+            &mut s,
+            "beamsocket_rooms",
+            "Live rooms.",
+            self.room_count() as u64,
+        );
+        gauge(
+            &mut s,
+            "beamsocket_uptime_seconds",
+            "Seconds since the engine booted.",
+            self.uptime_ms() / 1000,
+        );
+        counter(
+            &mut s,
+            "beamsocket_messages_in_total",
+            "Messages received from clients.",
+            Metrics::get(&m.messages_in),
+        );
+        counter(
+            &mut s,
+            "beamsocket_messages_out_total",
+            "Messages sent to clients.",
+            Metrics::get(&m.messages_out),
+        );
+        counter(
+            &mut s,
+            "beamsocket_bytes_in_total",
+            "Bytes received from clients.",
+            Metrics::get(&m.bytes_in),
+        );
+        counter(
+            &mut s,
+            "beamsocket_bytes_out_total",
+            "Bytes sent to clients.",
+            Metrics::get(&m.bytes_out),
+        );
+        counter(
+            &mut s,
+            "beamsocket_backpressure_drops_total",
+            "Frames dropped / connections cut by a send-queue backpressure policy.",
+            Metrics::get(&m.backpressure_drops),
+        );
+        counter(
+            &mut s,
+            "beamsocket_bridge_dropped_total",
+            "Message events shed at the bounded engine-to-bridge queue.",
+            Metrics::get(&m.bridge_dropped),
+        );
+        counter(
+            &mut s,
+            "beamsocket_admission_rejected_ip_total",
+            "Handshakes rejected by maxConnectionsPerIp.",
+            Metrics::get(&m.admission_rejected_ip),
+        );
+        counter(
+            &mut s,
+            "beamsocket_authorize_rejected_total",
+            "Connections closed by an authorize rejection.",
+            Metrics::get(&m.authorize_rejected),
+        );
+        counter(
+            &mut s,
+            "beamsocket_authorize_timed_out_total",
+            "Connections closed because authorize never settled in time.",
+            Metrics::get(&m.authorize_timed_out),
+        );
+        counter(
+            &mut s,
+            "beamsocket_pending_overflow_total",
+            "Handshakes shed because the pending-upgrade table was full.",
+            Metrics::get(&m.pending_overflow),
+        );
+        let _ = writeln!(
+            s,
+            "# HELP beamsocket_bridge_pressure Rust-to-JS bridge saturation (0..1).\n# TYPE beamsocket_bridge_pressure gauge\nbeamsocket_bridge_pressure {}",
+            self.bridge_pressure()
+        );
+
+        // Rates only when the sampler is running.
+        if let Some(r) = self.rates() {
+            let rate = |s: &mut String, name: &str, help: &str, v1: f64, v10: f64| {
+                let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge");
+                let _ = writeln!(s, "{name}{{window=\"1s\"}} {v1}");
+                let _ = writeln!(s, "{name}{{window=\"10s\"}} {v10}");
+            };
+            rate(
+                &mut s,
+                "beamsocket_messages_in_per_second",
+                "EWMA inbound message rate.",
+                Rates::load(&r.messages_in_1s),
+                Rates::load(&r.messages_in_10s),
+            );
+            rate(
+                &mut s,
+                "beamsocket_messages_out_per_second",
+                "EWMA outbound message rate.",
+                Rates::load(&r.messages_out_1s),
+                Rates::load(&r.messages_out_10s),
+            );
+            rate(
+                &mut s,
+                "beamsocket_bytes_in_per_second",
+                "EWMA inbound byte rate.",
+                Rates::load(&r.bytes_in_1s),
+                Rates::load(&r.bytes_in_10s),
+            );
+            rate(
+                &mut s,
+                "beamsocket_bytes_out_per_second",
+                "EWMA outbound byte rate.",
+                Rates::load(&r.bytes_out_1s),
+                Rates::load(&r.bytes_out_10s),
+            );
+        }
+        s
     }
 
     /// Bridge back-pressure gauge (`metrics().bridgePressure`), 0.0..=1.0.
