@@ -1,0 +1,21 @@
+{
+  "heal_ms_from_deny_clear": 1905,
+  "islands": [
+    [
+      0,
+      1
+    ],
+    [
+      2,
+      3,
+      4
+    ]
+  ],
+  "islands_stabilized_ms": 5709,
+  "nodes": 5,
+  "params": "tuned",
+  "pass_zero_stuck": true,
+  "refutations": 5,
+  "scenario": "partition",
+  "stuck_entries_after_heal": 0
+}
