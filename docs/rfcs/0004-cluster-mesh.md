@@ -1,8 +1,13 @@
 # RFC 0004 — Cluster Mesh (Phase 3)
 
-**Status:** DRAFT — spike-gated; freezes only after review + `0004-results.md`
-**Gate scope:** No Phase 3 production code — engine, SDK, or bridge — until this
-RFC survives review and freezes. The Phase 3 work order does not exist until then.
+**Status:** FROZEN — architect review complete (three §4.4 hardening fixes
+folded in: sender-suppression rule, pinned/direction-bound handshake
+transcript, UDP probe-only with frozen format). **Conditional on the
+real-hardware 30-minute loaded soak** (named in `0004-results.md`), same
+precedent as 1.1's macOS CI-gated row: implementation may proceed; no release
+claims cluster support until the soak is green.
+**Gate scope:** Phase 3 implementation follows the 3A–3D work orders
+(ENGINEERING §13); sub-phase gates close sequentially as always.
 **Depends on:** ARCHITECTURE.md §6 (the three seams), the 1C delivery-semantics
 note (ARCHITECTURE §4), ENGINEERING §1 + §12 rules (they apply across nodes),
 RFC 0001/0002 discipline (pre-registered predictions, hard gates, honest
@@ -219,7 +224,7 @@ heuristics on a corrupted stream.
 | 0x01 | HELLO | control | magic `BSMH`, protocol_version u16, node_id u16, cluster_name, incarnation, max_frame, feature bits (reserved u32) |
 | 0x02 | CHALLENGE | control | 32-byte nonce |
 | 0x03 | AUTH | control | HMAC-SHA256(secret, nonce ‖ transcript) |
-| 0x04 | MEMBERSHIP | control | piggybacked SWIM updates (also flows over UDP probes) |
+| 0x04 | MEMBERSHIP | control | piggybacked SWIM updates (TCP links ONLY — UDP is probe-only, see the frozen-format rule below) |
 | 0x05 | INTEREST | control | edge-triggered add/remove entries + per-origin seq |
 | 0x06 | INTEREST_DIGEST | control | anti-entropy hash |
 | 0x07 | RELAY_ROOM | data | room, origin node, payload (text/binary flag in `flags`) |
@@ -231,23 +236,39 @@ heuristics on a corrupted stream.
 **Version negotiation (the P4 section):**
 
 - One `protocol_version: u16` in HELLO, bumped **only** for incompatible
-  changes. Additive changes ride **feature bits** and the unknown-kind rule
-  instead.
+  changes. Additive changes ride **feature bits**.
 - **Compatibility promise: version N interoperates with N−1** (one-step
   rolling deploys are the supported path; skipping versions in one deploy is
   not). The link speaks `min(local, remote)`; a node seeing a version outside
   `{N, N−1}` **refuses the link with an explicit LOGGED error** naming both
   versions — visible in metrics as a distinct link-state, never a silent
   retry loop.
-- **Unknown-kind rule:** frames are self-delimiting, so an unknown `kind`
-  within an accepted version is **skipped and counted** (`unknownFrames`
-  metric) — this is what lets N−1 ignore N's additive frames during the
-  deploy window.
+- **Sender-suppression rule (review hit 1 — the load-bearing rule):** a node
+  **never emits** a kind or feature the peer did not advertise. Feature bits
+  are an **intersection**: usable only when BOTH sides set them, and a feature
+  bit may gate *which frames exist*, never *how an existing frame parses*.
+  Corollary: **new data-plane kinds (`RELAY_*`) are never additive** — they
+  are feature-gated or version-bumped, no third option. A skipped relay frame
+  is a silently lost message; we do not design message loss into deploys.
+- **Unknown-kind rule (demoted to defense-in-depth):** frames are
+  self-delimiting, so an unknown `kind` is skipped and counted
+  (`unknownFrames` metric). Under sender suppression this counter should read
+  **zero**; a nonzero value is a bug detector, not a compatibility mechanism.
 - **Body evolution rule:** existing frame bodies are append-only within a
   protocol version; readers must tolerate longer-than-known bodies (trailing
   bytes ignored). Any change that can't obey that rule bumps the version.
+  (HELLO itself is append-only, which is also how the feature-bit space
+  extends past the initial u32.)
 - The cluster name in HELLO partitions accidental cross-cluster joins
   (staging node dialing prod refuses at HELLO, before auth).
+- **UDP is probe-only and its format is frozen (review hit 3):** the N/N−1
+  promise is negotiated on TCP links, so SWIM UDP packets carry **no
+  negotiated context**. Therefore: UDP carries PING/ACK/PING-REQ probes
+  **only** — membership *dissemination* (MEMBERSHIP frames) flows exclusively
+  over negotiated TCP links. The UDP probe packet format is version-stamped,
+  append-only, and **frozen forever** at ship; any probe evolution that can't
+  be append-only moves probing onto TCP rather than breaking the frozen
+  format.
 
 ### 4.5 IDs — the opaque-ID seam cashes in
 
@@ -322,9 +343,16 @@ alpha.** Phase 3 ships secret-based mutual authentication:
 - `cluster.secret` (config; same value on every node). Mesh join runs a
   **mutual HMAC-SHA256 challenge-response**: HELLO → CHALLENGE(nonce) →
   AUTH(HMAC(secret, nonce ‖ handshake transcript)) in **both directions**
-  before any other frame is accepted. Binding the transcript (versions, node
-  ids, cluster name) into the MAC prevents downgrade/mix-and-match splicing.
-  The secret itself never crosses the wire.
+  before any other frame is accepted. The secret itself never crosses the wire.
+- **Transcript pinned + direction bound (review hit 2):** "transcript" means
+  **both HELLO frame bodies, bit-exact as received** — covering
+  protocol_version, feature bits, node ids, cluster name, and max_frame — so
+  any MITM tampering with negotiation (version/feature downgrade) breaks the
+  MAC. Each direction's MAC additionally includes a **distinct role label**
+  (`"bsmh-initiator"` / `"bsmh-responder"`) and the responder's fresh nonce,
+  so an attacker cannot reflect a node's own AUTH back at it. Both properties
+  get their own tests: a downgrade-tamper test and a reflection test, in the
+  implementation phase's required list.
 - SWIM UDP packets carry an HMAC tag over their body (cheap, per-packet) —
   membership is an attack surface too (a forged `dead` is a remote kick).
   Replay hardening: tag covers (incarnation, seq), stale seq ignored.
