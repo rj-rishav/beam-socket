@@ -1,0 +1,7 @@
+{
+  "converged_ms_from_first_spawn": 320,
+  "nodes": 5,
+  "params": "tuned",
+  "pass_lt_2000": true,
+  "scenario": "converge"
+}

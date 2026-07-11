@@ -1,0 +1,10 @@
+{
+  "false_positive_evictions": 0,
+  "nodes": 5,
+  "params": "tuned",
+  "pass_zero_fp": true,
+  "refutations": 0,
+  "scenario": "soak",
+  "seconds": 33,
+  "suspicion_events": 0
+}

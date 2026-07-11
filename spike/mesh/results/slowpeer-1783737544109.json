@@ -1,0 +1,38 @@
+{
+  "healthy_after": {
+    "acked": 500926,
+    "done": true,
+    "dropped": 0,
+    "hop_p50_us": 169,
+    "hop_p99_us": 942,
+    "rtt_p50_us": 274,
+    "rtt_p99_us": 2312,
+    "sent": 500000
+  },
+  "healthy_before": {
+    "acked": 500000,
+    "done": true,
+    "dropped": 0,
+    "hop_p50_us": 178,
+    "hop_p99_us": 833,
+    "rtt_p50_us": 285,
+    "rtt_p99_us": 1275,
+    "sent": 500000
+  },
+  "params": "tuned",
+  "pass_drops_counted_never_blocked": true,
+  "payload": 512,
+  "rate": 100000,
+  "scenario": "slowpeer",
+  "sender_admin_probe_max_us_during_saturation": 589,
+  "slow_link": {
+    "acked": 902,
+    "done": true,
+    "dropped": 492808,
+    "hop_p50_us": 2755329,
+    "hop_p99_us": 5441010,
+    "rtt_p50_us": 2755536,
+    "rtt_p99_us": 5441166,
+    "sent": 7192
+  }
+}
