@@ -47,7 +47,10 @@ Every PR is reviewed against these five rules. They come from ARCHITECTURE.md §
 | **1.1** | Attach to existing HTTP server | RFC 0002 written first, then Express/Fastify example | ✅ merged (macOS row CI-gated) |
 | **2A** | Observability read surface | §12 gates: stats/topRooms/backpressureReport + zero-hot-path-cost proof | ✅ merged (perf guard ON≈OFF) |
 | **2B** | Admin actions | §12 gates: disconnect verbs + identity/room cleanup proofs | ✅ merged (zero new teardown held) |
-| **3** | Cluster mesh | Starts with an RFC (0004), not a branch | next — RFC first |
+| **3A** | Mesh link layer (wire, handshake, coalesced writer) | §13 gates: interop matrix + attack tests | current |
+| **3B** | SWIM membership (graduated from spike, tuned row) | §13 gates: convergence/kill/heal + stuck-entry regression | after 3A |
+| **3C** | Interest routing (+ flood fallback lever) | §13 gates: correctness vs flood model, byte-reduction cell | after 3B |
+| **3D** | Relay verbs + engine integration | §13 gates: cross-node targeting E2E, 1C semantics under partition | after 3C |
 
 Phases are strictly sequential. **Do not start a phase while the previous phase's exit gate is open.**
 
@@ -337,3 +340,63 @@ PR notes honest.
 ### Explicitly NOT Phase 2
 Clustering (Phase 3), distributed presence (Phase 4), new transports
 (Phase 5), engine TLS (RFC 0003), Windows attach — parked, by name.
+
+---
+
+## 13. Phase 3 — Cluster Mesh (implementing frozen RFC 0004)
+
+**The RFC is the spec** — this section only defines the sub-phase split,
+the per-phase gates, and what graduates from `spike/mesh/`. All §1 and §12
+rules apply across nodes; RFC 0004's freeze is conditional on the
+real-hardware 30-minute soak, so **no release claims cluster support until
+that soak is green** (it shares the pinned-box trip with the alpha blockers).
+
+New crate: `crates/mesh` — pure Rust, no NAPI (same rationale as core);
+core depends on it behind the Engine facade, exactly where the RFC attaches.
+
+### 13.1 Phase 3A — Mesh link layer
+Wire framing + HELLO/CHALLENGE/AUTH handshake (§4.4/§4.7 as hardened at
+freeze), sender-suppression + feature-bit intersection, coalesced link
+writer (the spike-forced requirement — per-frame writes failed the gate),
+per-peer byte-bounded drop-and-count queues + per-peer pressure gauges.
+**Gates:** N/N−1 interop matrix test; **downgrade-tamper test** and
+**reflection test** (named at freeze); cross-cluster-name refusal;
+link-saturation drop-and-count; unknownFrames==0 under mixed-feature load;
+relay-cell microbench reproduces the spike's <1 ms p99 with the coalesced
+writer.
+
+### 13.2 Phase 3B — SWIM membership
+Graduates the spike's SWIM with the TUNED parameter row (cited to
+`0004-results.md` — the literature row failed the detection gate),
+**push-pull join** (the stuck-entry fix), UDP probe-only frozen format with
+per-packet HMAC, membership events into `stats()`/`metricsText()`.
+**Gates:** cold-start convergence < 2 s (5 nodes); kill detection < 5 s;
+partition → island → heal with zero stuck entries (**the spike's negative
+result becomes a permanent regression test**); frozen-format golden-bytes
+test (probe packets byte-identical across builds).
+
+### 13.3 Phase 3C — Interest routing
+Edge-triggered interest add/remove + per-origin seq + anti-entropy digest;
+interest map; `cluster.routing: 'interest' | 'flood'` (flood is the
+operational fallback lever, documented, never default).
+**Gates:** routing correctness vs a flood reference model under proptest
+churn (join/leave/partition); the byte-reduction cell re-measured (spike
+baseline: 22×); digest repairs a deliberately corrupted interest map.
+
+### 13.4 Phase 3D — Relay verbs + engine integration
+Node-prefixed ConnectionIds (`ids.ts` codec change — the §4.5 payoff, zero
+SDK API break), `toRoom`/`toUser`/`toSocket`/`broadcast` cross-node at the
+Engine facade, serialize-once preserved across the hop (pointer-identity
+test, 1B precedent, now spanning the relay), cluster fields in
+`stats()`/`metricsText()`, `cluster: { listen, seeds, secret }` config.
+**Gates:** 3-node E2E — every targeting verb reaches remote members exactly
+once, `except` honored across nodes; delivery semantics under partition
+stated-and-tested in 1C currency (drops counted, no stronger promise);
+single-node mode with no `cluster` config is bit-identical in behavior and
+perf (the zero-cost-when-unused proof, §12 rule 1 applied to the mesh);
+existing 112-test suite green untouched.
+
+### Explicitly NOT Phase 3
+Distributed presence/identity state (Phase 4 — the mesh carries frames, not
+state), mTLS (RFC 0003 seam), node autodiscovery beyond seeds, N > 50
+topologies, any delivery guarantee stronger than single-node 1C semantics.
