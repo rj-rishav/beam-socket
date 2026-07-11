@@ -1,0 +1,18 @@
+{
+  "params": "tuned",
+  "pass_hop_p99_lt_1ms": false,
+  "payload": 64,
+  "rate": 100000,
+  "result": {
+    "acked": 1000000,
+    "done": true,
+    "dropped": 0,
+    "hop_p50_us": 571,
+    "hop_p99_us": 3771,
+    "rtt_p50_us": 1448,
+    "rtt_p99_us": 10963,
+    "sent": 1000000
+  },
+  "scenario": "relay",
+  "seconds": 10
+}

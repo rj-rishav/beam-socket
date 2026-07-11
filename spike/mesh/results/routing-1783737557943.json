@@ -1,0 +1,12 @@
+{
+  "cross_node_membership": "10% (r % 10 == 0 also hosted on next node)",
+  "flood_bytes": 11462000,
+  "flood_over_interest": 22.0,
+  "interest_bytes": 521000,
+  "msgs_per_room": 20,
+  "nodes": 5,
+  "pass_gt_5x": true,
+  "payload": 512,
+  "rooms_per_node": 50,
+  "scenario": "routing"
+}
