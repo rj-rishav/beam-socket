@@ -255,7 +255,7 @@ Design notes:
 
 Phase 1 is single-process, but three seams are built in from day one:
 
-1. **Trait-shaped registries.** `RoomRegistry`, `PresenceStore`, and `Broadcaster` are traits with local implementations. Phase 2 clustering swaps in distributed implementations (gossip or control-plane backed) without touching connection code.
+1. **Trait-shaped registries.** *(Audited by RFC 0004's seam check — honest correction:)* as built, only `PresenceStore` is literally trait-shaped; the room/identity registries are concrete sharded structures. The seam that actually held is the **Engine facade**: RFC 0004's mesh attaches additively at the facade (local fan-out + inter-node relay) without touching registry or connection code. The original claim was aspirational; the facade delivered what the traits promised.
 2. **Opaque, prefix-able IDs.** Connection and room IDs are opaque strings in the public API; the internal encoding can gain a node-ID prefix for cluster-wide routing with zero API change.
 3. **Message-passing internals.** Components communicate via typed events and channels, not shared method calls. A channel crossing a process boundary later is an implementation detail.
 
