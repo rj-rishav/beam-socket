@@ -1,0 +1,26 @@
+{
+  "max_detection_ms": 8907,
+  "nodes": 5,
+  "params": "literature",
+  "pass_lt_5000": false,
+  "per_survivor": {
+    "0": {
+      "dead_ms": 8804,
+      "suspect_ms": 3296
+    },
+    "1": {
+      "dead_ms": 8900,
+      "suspect_ms": 3895
+    },
+    "2": {
+      "dead_ms": 8804,
+      "suspect_ms": 3497
+    },
+    "3": {
+      "dead_ms": 8907,
+      "suspect_ms": 4097
+    }
+  },
+  "scenario": "kill",
+  "victim": 4
+}
