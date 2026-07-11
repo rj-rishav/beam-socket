@@ -13,7 +13,7 @@ whole per-message data plane stays off the JS event loop. Phase 0 gate met: RFC
 (runtime maturity) is complete and merged**: the full observability read surface
 (`stats`, `topRooms`, `backpressureReport`, `memoryUsage`, Prometheus export —
 zero hot-path cost, proven) plus the admin verbs (`disconnectSocket`,
-`disconnectUser`, `closeRoom`). Next: Phase 3 (cluster mesh) opens with RFC 0004
+`disconnectUser`, `closeRoom`). **Phase 3 (cluster mesh) is in progress** — RFC 0004 is FROZEN (soak-conditional) and implementation follows ENGINEERING §13 (3A–3D)
 — see [ENGINEERING.md §12](docs/ENGINEERING.md).
 
 **Release blockers before the alpha goes public** (need real hardware /
