@@ -77,6 +77,25 @@ impl std::fmt::Display for Suppressed {
     }
 }
 
+/// Called by the reader for each inbound **data-plane** frame (MEMBERSHIP,
+/// INTEREST*, RELAY*) with the peer's node id. 3B uses it to feed MEMBERSHIP
+/// frames to the dissemination plane; 3A's PING/PONG and control frames never
+/// reach it. Runs on the link's reader task — keep it cheap and non-blocking.
+pub type InboundHandler = Arc<dyn Fn(u16, &Frame) + Send + Sync>;
+
+/// Called once when the link's reader exits (peer closed, IO error, oversize, or
+/// a local `close()`), with the peer's node id. 3B wires this to suspicion —
+/// a dead TCP link is evidence the peer may be gone.
+pub type CloseHandler = Arc<dyn Fn(u16) + Send + Sync>;
+
+/// Optional per-link callbacks. `Default` (both `None`) reproduces exact 3A
+/// behavior, so the existing `connect`/`accept` API is unchanged.
+#[derive(Clone, Default)]
+pub struct LinkHooks {
+    pub inbound: Option<InboundHandler>,
+    pub on_close: Option<CloseHandler>,
+}
+
 /// A handle to a live link. Cheap to clone (all shared state is `Arc`); holds
 /// the send queue, the counters, and the negotiated parameters. The reader,
 /// writer, and keepalive run as background tasks; dropping every handle does
@@ -211,14 +230,33 @@ impl Link {
         addr: impl ToSocketAddrs,
         cfg: LinkConfig,
     ) -> Result<LinkHandle, LinkError> {
+        Self::connect_with(addr, cfg, LinkHooks::default()).await
+    }
+
+    /// [`Link::connect`] with inbound/close hooks (3B wires the dissemination
+    /// plane + suspicion here).
+    pub async fn connect_with(
+        addr: impl ToSocketAddrs,
+        cfg: LinkConfig,
+        hooks: LinkHooks,
+    ) -> Result<LinkHandle, LinkError> {
         let stream = TcpStream::connect(addr).await?;
-        establish(stream, cfg, Role::Initiator).await
+        establish(stream, cfg, Role::Initiator, hooks).await
     }
 
     /// Run the handshake as the **responder** on an accepted stream, and spawn
     /// the link tasks.
     pub async fn accept(stream: TcpStream, cfg: LinkConfig) -> Result<LinkHandle, LinkError> {
-        establish(stream, cfg, Role::Responder).await
+        Self::accept_with(stream, cfg, LinkHooks::default()).await
+    }
+
+    /// [`Link::accept`] with inbound/close hooks.
+    pub async fn accept_with(
+        stream: TcpStream,
+        cfg: LinkConfig,
+        hooks: LinkHooks,
+    ) -> Result<LinkHandle, LinkError> {
+        establish(stream, cfg, Role::Responder, hooks).await
     }
 
     /// The reconnect backoff seam (§4.7 "backoff, not retry storms"). 3B's
@@ -258,6 +296,7 @@ async fn establish(
     stream: TcpStream,
     cfg: LinkConfig,
     role: Role,
+    hooks: LinkHooks,
 ) -> Result<LinkHandle, LinkError> {
     stream.set_nodelay(true).ok();
     let counters = Arc::new(LinkCounters::default());
@@ -285,13 +324,17 @@ async fn establish(
     let shutdown = Arc::new(Notify::new());
     let peer_node_id = negotiated.peer_node_id;
     let idle = IdleClock::new();
+    let rctx = Arc::new(ReaderCtx {
+        queue: queue.clone(),
+        counters: counters.clone(),
+        negotiated: negotiated.clone(),
+        hooks,
+    });
 
     tokio::spawn(writer_loop(queue.clone(), wr, counters.clone()));
     tokio::spawn(reader_loop(
         rd,
-        queue.clone(),
-        counters.clone(),
-        negotiated.clone(),
+        rctx,
         state.clone(),
         shutdown.clone(),
         idle.clone(),
@@ -397,11 +440,17 @@ async fn writer_loop(queue: Arc<PeerQueue>, mut wr: OwnedWriteHalf, counters: Ar
 /// `unknownFrames` for anything a well-behaved peer under sender-suppression
 /// would never send, and closes (counted) on an oversize length prefix — no
 /// resync (§4.4).
-async fn reader_loop(
-    mut rd: OwnedReadHalf,
+/// Everything the reader task needs, bundled so its arity stays sane.
+struct ReaderCtx {
     queue: Arc<PeerQueue>,
     counters: Arc<LinkCounters>,
     negotiated: Negotiated,
+    hooks: LinkHooks,
+}
+
+async fn reader_loop(
+    mut rd: OwnedReadHalf,
+    ctx: Arc<ReaderCtx>,
     state: Arc<AtomicU8>,
     shutdown: Arc<Notify>,
     idle: IdleClock,
@@ -410,16 +459,16 @@ async fn reader_loop(
         tokio::select! {
             biased;
             _ = shutdown.notified() => break,
-            r = read_raw_frame(&mut rd, negotiated.max_frame) => match r {
+            r = read_raw_frame(&mut rd, ctx.negotiated.max_frame) => match r {
                 Ok((kind_byte, flags, body)) => {
                     idle.stamp();
-                    LinkCounters::add(&counters.bytes_in, (HEADER_LEN + body.len()) as u64);
-                    dispatch(&queue, &counters, &negotiated, kind_byte, flags, &body);
+                    LinkCounters::add(&ctx.counters.bytes_in, (HEADER_LEN + body.len()) as u64);
+                    dispatch(&ctx, kind_byte, flags, &body);
                 }
                 Err(LinkError::Oversize { .. }) => {
                     // The close IS the response. Count once, do not hunt for the
                     // next boundary on a stream we no longer trust.
-                    LinkCounters::add(&counters.oversize_closes, 1);
+                    LinkCounters::add(&ctx.counters.oversize_closes, 1);
                     break;
                 }
                 Err(_) => break, // EOF / io / malformed → link down
@@ -427,53 +476,57 @@ async fn reader_loop(
         }
     }
     state.store(LinkState::Closed as u8, Ordering::Release);
-    queue.close();
+    ctx.queue.close();
+    // Wire link death into 3B suspicion: a dead link is evidence the peer may
+    // be gone (the reconnect loop and probe plane decide what to do with it).
+    if let Some(on_close) = &ctx.hooks.on_close {
+        on_close(ctx.negotiated.peer_node_id);
+    }
 }
 
-fn dispatch(
-    queue: &Arc<PeerQueue>,
-    counters: &Arc<LinkCounters>,
-    negotiated: &Negotiated,
-    kind_byte: u8,
-    flags: u8,
-    _body: &[u8],
-) {
+fn dispatch(ctx: &ReaderCtx, kind_byte: u8, flags: u8, body: &[u8]) {
     let Some(kind) = FrameKind::from_u8(kind_byte) else {
         // Truly unknown kind: skip and count (§4.4 defense-in-depth). Frames are
         // self-delimiting, so skipping is safe; under sender suppression this
         // never fires.
-        LinkCounters::add(&counters.unknown_frames, 1);
+        LinkCounters::add(&ctx.counters.unknown_frames, 1);
         return;
     };
 
     // A KNOWN but non-negotiated feature kind should never arrive under sender
     // suppression either — treat it the same way (a bug detector, not a parse).
-    if is_feature_gated(kind) && !negotiated.may_emit(kind) {
-        LinkCounters::add(&counters.unknown_frames, 1);
+    if is_feature_gated(kind) && !ctx.negotiated.may_emit(kind) {
+        LinkCounters::add(&ctx.counters.unknown_frames, 1);
         return;
     }
 
-    LinkCounters::add(&counters.frames_in, 1);
+    LinkCounters::add(&ctx.counters.frames_in, 1);
 
     match kind {
         FrameKind::Ping => {
             if Flags(flags).has(Flags::PONG) {
-                LinkCounters::add(&counters.pongs_recv, 1);
+                LinkCounters::add(&ctx.counters.pongs_recv, 1);
             } else {
                 // Reply with a PONG. It rides the same bounded queue as data; a
                 // dropped PONG just means the peer PINGs again next interval.
-                let _ = queue.push(ping_frame(true).encode());
+                let _ = ctx.queue.push(ping_frame(true).encode());
             }
         }
-        // 3A carries but does not interpret these — their engines are 3B–3D.
-        // Counting them (frames_in above) is the whole job at this layer.
+        // Data-plane frames: hand to the inbound hook if wired (3B's MEMBERSHIP
+        // dissemination, 3C/3D later); with no hook this is exactly 3A — counted
+        // and dropped.
         FrameKind::Membership
         | FrameKind::Interest
         | FrameKind::InterestDigest
         | FrameKind::RelayRoom
         | FrameKind::RelayUser
         | FrameKind::RelayAll
-        | FrameKind::RelaySocket => {}
+        | FrameKind::RelaySocket => {
+            if let Some(inbound) = &ctx.hooks.inbound {
+                let frame = Frame::with_flags(kind, Flags(flags), body.to_vec());
+                inbound(ctx.negotiated.peer_node_id, &frame);
+            }
+        }
         // Handshake kinds after the handshake are a protocol quirk; count as
         // frames_in and ignore (a peer re-HELLOing does not restart auth).
         FrameKind::Hello | FrameKind::Challenge | FrameKind::Auth => {}
