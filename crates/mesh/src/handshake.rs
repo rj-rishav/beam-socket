@@ -250,6 +250,10 @@ impl Handshake {
             incarnation: self.cfg.incarnation,
             max_frame: self.cfg.max_frame,
             features: self.cfg.features,
+            // 3A review fixup — initiator freshness: a per-attempt random nonce
+            // makes every transcript unique, so a full recorded-session replay
+            // can never verify (the MAC covers both HELLO bodies bit-exact).
+            fresh: random_nonce(),
             cluster_name: self.cfg.cluster_name.clone(),
         };
         self.my_hello_raw = hello.encode();
