@@ -24,13 +24,20 @@ pub struct Hello {
     pub incarnation: u64,
     pub max_frame: u32,
     pub features: u32,
+    /// Fresh random bytes minted per handshake attempt (3A review fixup —
+    /// initiator freshness). Because the §4.7 transcript is both HELLO bodies
+    /// bit-exact, this field freshens BOTH AUTH MACs: a full recorded-session
+    /// replay can never verify against a new session, since the new side's
+    /// `fresh` differs and therefore so does the transcript. Base field, not
+    /// append-only tail — added before any node was ever deployed.
+    pub fresh: [u8; 32],
     pub cluster_name: String,
 }
 
 /// Fixed-size prefix before the variable-length cluster name:
 /// magic(4) + version(2) + node_id(2) + incarnation(8) + max_frame(4) +
-/// features(4) + name_len(2).
-const FIXED_PREFIX: usize = 4 + 2 + 2 + 8 + 4 + 4 + 2;
+/// features(4) + fresh(32) + name_len(2).
+const FIXED_PREFIX: usize = 4 + 2 + 2 + 8 + 4 + 4 + 32 + 2;
 
 /// A cluster name is an operator label, not a payload. Cap it so a hostile
 /// HELLO cannot make the name field an allocation lever, and so the whole HELLO
@@ -49,6 +56,7 @@ impl Hello {
         out.extend_from_slice(&self.incarnation.to_le_bytes());
         out.extend_from_slice(&self.max_frame.to_le_bytes());
         out.extend_from_slice(&self.features.to_le_bytes());
+        out.extend_from_slice(&self.fresh);
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         out
@@ -69,7 +77,8 @@ impl Hello {
         let incarnation = u64::from_le_bytes(body[8..16].try_into().unwrap());
         let max_frame = u32::from_le_bytes(body[16..20].try_into().unwrap());
         let features = u32::from_le_bytes(body[20..24].try_into().unwrap());
-        let name_len = u16::from_le_bytes([body[24], body[25]]) as usize;
+        let fresh: [u8; 32] = body[24..56].try_into().unwrap();
+        let name_len = u16::from_le_bytes([body[56], body[57]]) as usize;
 
         if name_len > MAX_CLUSTER_NAME_LEN {
             return Err(HelloError::ClusterNameTooLong(name_len));
@@ -90,6 +99,7 @@ impl Hello {
             incarnation,
             max_frame,
             features,
+            fresh,
             cluster_name,
         })
     }
@@ -136,8 +146,25 @@ mod tests {
             incarnation: 42,
             max_frame: 16 << 20,
             features: 0b101,
+            fresh: [0xA5; 32], // fixed in tests; random in production (handshake.rs)
             cluster_name: "prod".to_string(),
         }
+    }
+
+    #[test]
+    fn fresh_survives_round_trip_and_differs_when_reminted() {
+        let body = sample().encode();
+        assert_eq!(Hello::decode(&body).unwrap().fresh, [0xA5; 32]);
+        // Two production HELLOs never share a transcript (freshness fixup).
+        let a = Hello {
+            fresh: crate::crypto::random_nonce(),
+            ..sample()
+        };
+        let b = Hello {
+            fresh: crate::crypto::random_nonce(),
+            ..sample()
+        };
+        assert_ne!(a.encode(), b.encode());
     }
 
     #[test]
