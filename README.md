@@ -21,7 +21,9 @@ credentials, not closable in a sandbox): pinned-box bridge-constant
 re-confirmation (`--gate-seconds 600`), pinned-box benchmark suite (100k fan-out
 gate, Socket.IO ≥25k, echo p99), the full 10-minute soak, npm publish +
 per-platform install test, and the darwin CI run that proves the macOS attach
-row. **Parked backlog** (deliberately after Phase 2): RFC 0003 engine-side TLS
+row. **Before any release claims cluster support:** RFC 0004's 30-minute
+real-hardware mesh soak, and swapping the mesh's vendored HMAC/SHA-256 for the
+audited `hmac`/`sha2` crates (auth-path crypto ships audited, not hand-rolled). **Parked backlog** (deliberately after Phase 2): RFC 0003 engine-side TLS
 (`listen(443, { cert })`, rustls) and the Windows fd-handoff spike
 (`WSADuplicateSocket`).
 
