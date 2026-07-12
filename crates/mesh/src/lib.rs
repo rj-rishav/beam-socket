@@ -37,15 +37,21 @@ pub mod frame;
 pub mod handshake;
 pub mod hello;
 pub mod link;
+pub mod membership_sync;
+pub mod node;
+pub mod probe;
 pub mod queue;
+pub mod swim;
 
 pub use config::LinkConfig;
 pub use counters::LinkCounters;
 pub use frame::{Flags, Frame, FrameError, FrameKind, MAX_FRAME_CEILING, MIN_FRAME_FLOOR};
 pub use handshake::{Handshake, HandshakeError, HandshakeStep, Negotiated, RefuseReason, Role};
 pub use hello::Hello;
-pub use link::{Link, LinkError, LinkHandle, LinkState};
+pub use link::{Link, LinkError, LinkHandle, LinkHooks, LinkState};
+pub use node::{MeshConfig, MeshNode};
 pub use queue::PeerQueue;
+pub use swim::{MState, MemberInfo, Membership, MembershipCounters, SwimParams};
 
 /// The mesh wire protocol version (RFC 0004 §4.4). Bumped **only** for
 /// incompatible changes; additive changes ride feature bits ([`hello::Hello`]).
