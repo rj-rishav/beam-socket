@@ -48,8 +48,8 @@ Every PR is reviewed against these five rules. They come from ARCHITECTURE.md §
 | **2A** | Observability read surface | §12 gates: stats/topRooms/backpressureReport + zero-hot-path-cost proof | ✅ merged (perf guard ON≈OFF) |
 | **2B** | Admin actions | §12 gates: disconnect verbs + identity/room cleanup proofs | ✅ merged (zero new teardown held) |
 | **3A** | Mesh link layer (wire, handshake, coalesced writer) | §13 gates: interop matrix + attack tests | ✅ merged (126 tests; vendored crypto → audited before release) |
-| **3B** | SWIM membership (graduated from spike, tuned row) | §13 gates: convergence/kill/heal + stuck-entry regression | after 3A |
-| **3C** | Interest routing (+ flood fallback lever) | §13 gates: correctness vs flood model, byte-reduction cell | after 3B |
+| **3B** | SWIM membership (graduated from spike, tuned row) | §13 gates: convergence/kill/heal + stuck-entry regression | ✅ merged (148 tests; +3A initiator-freshness fixup) |
+| **3C** | Interest routing (+ flood fallback lever) | §13 gates: correctness vs flood model, byte-reduction cell | current |
 | **3D** | Relay verbs + engine integration | §13 gates: cross-node targeting E2E, 1C semantics under partition | after 3C |
 
 Phases are strictly sequential. **Do not start a phase while the previous phase's exit gate is open.**
