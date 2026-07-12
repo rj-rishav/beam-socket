@@ -1,0 +1,22 @@
+[package]
+name = "beamsocket-mesh"
+version = "0.0.0"
+edition = "2021"
+description = "BeamSocket cluster mesh — the inter-node link layer (RFC 0004). Pure Rust, never imports NAPI (same rule as core)."
+
+[dependencies]
+# The link layer is async socket IO and nothing else. Same tokio feature set as
+# core, so the workspace compiles tokio exactly once (no new lockfile churn).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+
+# NOTE (deliberate non-dependency): HMAC-SHA256 is vendored in `crypto.rs`
+# rather than pulled from `hmac`/`sha2`. Rationale in the PR notes — it keeps
+# this crate std + tokio only (offline-buildable, zero Cargo.lock churn beyond
+# the new member), and RFC 4231 / FIPS 180-4 known-answer vectors prove it. A
+# swap to the RustCrypto crates is a one-line dependency change if review
+# prefers audited crypto over a vendored primitive.
+
+[dev-dependencies]
+# Integration gates (§13.1) drive real loopback links, so the test crates need
+# their own tokio (runtime + `#[tokio::test]` + a listener + timers).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
