@@ -27,6 +27,8 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Backoff, LinkConfig};
 use crate::frame::{Frame, FrameKind};
+use crate::handshake::features;
+use crate::interest::{self, InterestCounters, InterestState, InterestUpdate, Routing, Target};
 use crate::link::{CloseHandler, InboundHandler, Link, LinkHandle, LinkHooks};
 use crate::membership_sync::{self, MembershipMsg};
 use crate::probe::{ProbeCounters, ProbePlane};
@@ -48,6 +50,9 @@ pub struct MeshConfig {
     pub secret: Vec<u8>,
     pub cluster_name: String,
     pub params: SwimParams,
+    /// Routing mode (§4.3). Defaults to `Interest`; `Flood` is the operational
+    /// fallback lever, never the default.
+    pub routing: Routing,
 }
 
 impl MeshConfig {
@@ -59,6 +64,7 @@ impl MeshConfig {
             secret: secret.into(),
             cluster_name: "default".to_string(),
             params: SwimParams::tuned(),
+            routing: Routing::Interest,
         }
     }
 }
@@ -71,6 +77,7 @@ struct Inner {
     params: SwimParams,
     seeds: Vec<SocketAddr>,
     membership: Arc<Mutex<Membership>>,
+    interest: Arc<Mutex<InterestState>>,
     links: Mutex<HashMap<u16, LinkHandle>>,
     deny: Arc<Mutex<HashSet<u16>>>,
     dial_backoff: Mutex<HashMap<SocketAddr, (u32, Instant)>>,
@@ -80,7 +87,22 @@ struct Inner {
 
 impl Inner {
     fn link_cfg(&self) -> LinkConfig {
-        LinkConfig::new(self.self_id, self.cluster_name.clone(), self.secret.clone())
+        let mut c = LinkConfig::new(self.self_id, self.cluster_name.clone(), self.secret.clone());
+        // Advertise interest routing so INTEREST/INTEREST_DIGEST frames pass the
+        // 3A feature-intersection + sender-suppression checks on the link.
+        c.features = features::INTEREST_ROUTING;
+        c
+    }
+
+    fn alive_peer_ids(&self) -> HashSet<u16> {
+        self.membership
+            .lock()
+            .unwrap()
+            .table()
+            .into_iter()
+            .filter(|mi| mi.state == MState::Alive)
+            .map(|mi| mi.id)
+            .collect()
     }
 
     fn is_down(&self) -> bool {
@@ -101,21 +123,46 @@ impl Inner {
     }
 
     fn on_inbound(&self, peer: u16, frame: &Frame) {
-        if frame.kind != FrameKind::Membership {
-            return;
-        }
         if self.deny.lock().unwrap().contains(&peer) {
             return;
         }
-        let Some(msg) = MembershipMsg::decode(&frame.body) else {
-            return;
-        };
-        let resp = {
-            let mut m = self.membership.lock().unwrap();
-            membership_sync::apply(msg, &mut m, self.params.retransmit)
-        };
-        if let Some(resp) = resp {
-            self.send_to(peer, &resp);
+        match frame.kind {
+            FrameKind::Membership => {
+                let Some(msg) = MembershipMsg::decode(&frame.body) else {
+                    return;
+                };
+                let resp = {
+                    let mut m = self.membership.lock().unwrap();
+                    membership_sync::apply(msg, &mut m, self.params.retransmit)
+                };
+                if let Some(resp) = resp {
+                    self.send_to(peer, &resp);
+                }
+            }
+            FrameKind::Interest => {
+                let Some(update) = InterestUpdate::decode(&frame.body) else {
+                    return;
+                };
+                let mut i = self.interest.lock().unwrap();
+                match update {
+                    InterestUpdate::Edge(e) => {
+                        i.apply_edge(&e);
+                    }
+                    InterestUpdate::Snapshot(s) => {
+                        i.apply_snapshot(&s);
+                    }
+                }
+            }
+            FrameKind::InterestDigest => {
+                let Some(digest) = interest::decode_digest(&frame.body) else {
+                    return;
+                };
+                let snaps = self.interest.lock().unwrap().respond_to_digest(&digest);
+                for s in snaps {
+                    self.send_interest(peer, &InterestUpdate::Snapshot(s));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -134,6 +181,20 @@ impl Inner {
         let handle = self.links.lock().unwrap().get(&peer).cloned();
         if let Some(h) = handle {
             let _ = h.try_send(Frame::new(FrameKind::Membership, msg.encode()));
+        }
+    }
+
+    fn send_interest(&self, peer: u16, update: &InterestUpdate) {
+        let handle = self.links.lock().unwrap().get(&peer).cloned();
+        if let Some(h) = handle {
+            let _ = h.try_send(Frame::new(FrameKind::Interest, update.encode()));
+        }
+    }
+
+    /// Broadcast an already-encoded frame to every current link.
+    fn broadcast_frame(&self, frame: Frame) {
+        for h in self.all_links() {
+            let _ = h.try_send(frame.clone());
         }
     }
 
@@ -163,6 +224,12 @@ impl Inner {
             }
         };
         self.send_to(peer, &sync);
+
+        // Full interest exchange on link-up (§4.3, same shape as the membership
+        // push-pull): send our local interest snapshot so the new peer learns
+        // what we host immediately; the digest converges the rest.
+        let snap = self.interest.lock().unwrap().local_snapshot();
+        self.send_interest(peer, &InterestUpdate::Snapshot(snap));
     }
 
     /// Addresses we should have a link to but don't: seeds (bootstrap/heal) and
@@ -252,6 +319,11 @@ impl MeshNode {
             deny.clone(),
         );
 
+        let interest = Arc::new(Mutex::new(InterestState::new(
+            config.node_id,
+            config.routing,
+        )));
+
         let inner = Arc::new(Inner {
             self_id: config.node_id,
             addr,
@@ -260,6 +332,7 @@ impl MeshNode {
             params: config.params,
             seeds: config.seeds,
             membership,
+            interest,
             links: Mutex::new(HashMap::new()),
             deny,
             dial_backoff: Mutex::new(HashMap::new()),
@@ -272,6 +345,7 @@ impl MeshNode {
             tokio::spawn(dial_loop(inner.clone())),
             tokio::spawn(gossip_loop(inner.clone())),
             tokio::spawn(digest_loop(inner.clone())),
+            tokio::spawn(interest_loop(inner.clone())),
         ];
 
         Ok(Arc::new(MeshNode {
@@ -307,6 +381,46 @@ impl MeshNode {
     /// this is false — "zero stuck entries").
     pub fn has_non_alive(&self) -> bool {
         self.inner.membership.lock().unwrap().has_non_alive()
+    }
+
+    // ── interest routing (3C) ──
+
+    /// Note a local hosting transition (0→1 `hosting=true`, 1→0 `false`) for a
+    /// room/user. **This is the seam 3D's engine drives** from the local
+    /// room/identity registries; in 3C a test double calls it. On a real
+    /// transition the edge is disseminated to every peer (edge-triggered, §4.3).
+    pub fn set_local_interest(&self, target: Target, hosting: bool) {
+        let edge = self
+            .inner
+            .interest
+            .lock()
+            .unwrap()
+            .local_set(target, hosting);
+        if let Some(edge) = edge {
+            let frame = Frame::new(FrameKind::Interest, InterestUpdate::Edge(edge).encode());
+            self.inner.broadcast_frame(frame);
+        }
+    }
+
+    /// **The routing seam 3D consumes:** the remote peers to relay `target` to.
+    /// Empty = no relay (nobody remote hosts it). Unreachable peers are excluded;
+    /// in `Flood` mode every alive peer is returned.
+    pub fn interested_peers(&self, target: &Target) -> Vec<u16> {
+        let alive = self.inner.alive_peer_ids();
+        self.inner
+            .interest
+            .lock()
+            .unwrap()
+            .interested_peers(target, &alive)
+    }
+
+    pub fn interest_counters(&self) -> InterestCounters {
+        self.inner.interest.lock().unwrap().counters()
+    }
+
+    /// Flip the routing lever at runtime (interest ⇄ flood).
+    pub fn set_routing(&self, routing: Routing) {
+        self.inner.interest.lock().unwrap().set_routing(routing);
     }
 
     /// Inject a partition: deny `peers` — drop their UDP, sever their TCP links,
@@ -420,6 +534,32 @@ async fn digest_loop(inner: Arc<Inner>) {
             membership_sync::build_digest(&m)
         };
         let frame = Frame::new(FrameKind::Membership, msg.encode());
+        for h in inner.all_links() {
+            let _ = h.try_send(frame.clone());
+        }
+    }
+}
+
+/// Interest anti-entropy: sweep evicted peers' interest (no stuck entries, the
+/// 3B lesson) and send the interest digest so any dropped edge self-heals.
+async fn interest_loop(inner: Arc<Inner>) {
+    loop {
+        tokio::time::sleep(DIGEST_INTERVAL).await;
+        if inner.is_down() {
+            return;
+        }
+        // Sweep interest for any origin not currently Alive in membership.
+        let alive = inner.alive_peer_ids();
+        {
+            let mut i = inner.interest.lock().unwrap();
+            for id in i.known_origins() {
+                if !alive.contains(&id) {
+                    i.sweep_origin(id);
+                }
+            }
+        }
+        let digest = inner.interest.lock().unwrap().build_digest();
+        let frame = Frame::new(FrameKind::InterestDigest, interest::encode_digest(&digest));
         for h in inner.all_links() {
             let _ = h.try_send(frame.clone());
         }
