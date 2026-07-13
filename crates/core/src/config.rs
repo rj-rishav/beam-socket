@@ -115,6 +115,23 @@ impl Default for Observability {
     }
 }
 
+/// Cluster mesh config (Phase 3D, RFC 0004 §5). **Absent = single-node** — the
+/// engine spawns no mesh, and the relay verbs are never reached (the
+/// zero-cost-when-unused contract, §12 rule 1 applied to the mesh).
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// Operator-assigned node id, unique in the mesh (§4.5).
+    pub node_id: u16,
+    /// Mesh bind address (TCP link + UDP swim share the port number).
+    pub listen: std::net::SocketAddr,
+    /// Seed members to bootstrap from (any live member works).
+    pub seeds: Vec<std::net::SocketAddr>,
+    /// Shared cluster secret (§4.7) — required; no secret, no cluster.
+    pub secret: Vec<u8>,
+    /// Cluster name — the accidental-cross-cluster barrier (§4.4).
+    pub cluster_name: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub limits: Limits,
@@ -123,6 +140,8 @@ pub struct Config {
     pub trust_proxy: TrustProxy,
     pub authorize: Authorize,
     pub observability: Observability,
+    /// Phase 3D. `None` (the default) is single-node — no mesh, zero cost.
+    pub cluster: Option<ClusterConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

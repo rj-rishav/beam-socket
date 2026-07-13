@@ -81,6 +81,27 @@ export interface BeamSocketConfig {
    * upgrades on the server (sole-handler mode — malformed upgrades get a 400).
    */
   path?: string;
+  /**
+   * Cluster mesh (Phase 3D, RFC 0004). **Absent = single-node** — no mesh, no
+   * cost. When present, targeting verbs (`toRoom`/`toUser`/`broadcast`/
+   * `toSocket`) also relay to the nodes that host the target; `socket.id`
+   * carries a node prefix (still opaque to apps). See §4.5/§4.6.
+   */
+  cluster?: ClusterConfig;
+}
+
+/** Cluster mesh options (RFC 0004 §5). */
+export interface ClusterConfig {
+  /** Operator-assigned node id, unique in the mesh. */
+  nodeId: number;
+  /** Mesh bind address, `host:port` (TCP link + UDP swim share the port). */
+  listen: string;
+  /** Seed member addresses to bootstrap from (any live member works). */
+  seeds?: string[];
+  /** Shared cluster secret — required; the same value on every node. */
+  secret: string;
+  /** Cluster name — the accidental-cross-cluster barrier. Defaults to `'default'`. */
+  clusterName?: string;
 }
 
 /**
@@ -249,6 +270,24 @@ export interface Stats extends Metrics {
   uptimeMs: number;
   /** `null` when the sampler is disabled (`observability.samplerMs: 0`). */
   rates: Rates | null;
+  /** Cluster mesh state (Phase 3D) — **absent when single-node**. */
+  cluster?: ClusterStats;
+}
+
+/** `stats().cluster` — mesh health, surfaced through the 2A stats surface. */
+export interface ClusterStats {
+  /** This node's id. */
+  nodeId: number;
+  /** Live peer links. */
+  peers: number;
+  /** Relay frames received and fanned out locally. */
+  relayIn: number;
+  /** Relay frames sent to peers. */
+  relayOut: number;
+  /** Relay frames dropped (full peer queue or unreachable peer). */
+  relayDrops: number;
+  /** Per-peer `[nodeId, pressure]` outbound-queue gauges (§4.6). */
+  peerPressures: Array<[number, number]>;
 }
 
 /** One row of `io.topRooms()`. */
