@@ -8,6 +8,10 @@ description = "BeamSocket cluster mesh — the inter-node link layer (RFC 0004).
 # The link layer is async socket IO and nothing else. Same tokio feature set as
 # core, so the workspace compiles tokio exactly once (no new lockfile churn).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+# Per-peer queues hold refcounted `Bytes` (3D §4.6): one relay-frame allocation
+# is clone-by-refcount into every interested peer's queue — serialize-once
+# across the hop. Already in the workspace lockfile (core uses it).
+bytes = "1"
 
 # NOTE (deliberate non-dependency): HMAC-SHA256 is vendored in `crypto.rs`
 # rather than pulled from `hmac`/`sha2`. Rationale in the PR notes — it keeps

@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use bytes::Bytes;
 use tokio::sync::Notify;
 
 /// The result of an enqueue. `Dropped` means the queue was at its byte cap and
@@ -35,7 +36,9 @@ pub enum PushOutcome {
 /// A byte-bounded, non-blocking, drop-newest-and-count outbound queue for one
 /// peer link.
 pub struct PeerQueue {
-    inner: Mutex<VecDeque<Vec<u8>>>,
+    /// Holds refcounted `Bytes`: a relay frame built once is clone-by-refcount
+    /// into every interested peer's queue (§4.6 serialize-once across the hop).
+    inner: Mutex<VecDeque<Bytes>>,
     /// Total bytes currently queued. Written under `inner`'s lock; read
     /// lock-free for the pressure gauge.
     queued_bytes: AtomicUsize,
@@ -68,7 +71,7 @@ impl PeerQueue {
     /// fit); that is a misconfiguration — `max_frame` should be ≤ HWM — but the
     /// queue's job is to bound memory, so it sheds and counts rather than ever
     /// exceeding the cap.
-    pub fn push(&self, frame: Vec<u8>) -> PushOutcome {
+    pub fn push(&self, frame: Bytes) -> PushOutcome {
         let mut q = self.inner.lock().unwrap();
         let queued = self.queued_bytes.load(Ordering::Relaxed);
         if queued + frame.len() > self.hwm_bytes {
@@ -161,8 +164,8 @@ impl PeerQueue {
 mod tests {
     use super::*;
 
-    fn frame(n: usize, fill: u8) -> Vec<u8> {
-        vec![fill; n]
+    fn frame(n: usize, fill: u8) -> Bytes {
+        Bytes::from(vec![fill; n])
     }
 
     #[test]

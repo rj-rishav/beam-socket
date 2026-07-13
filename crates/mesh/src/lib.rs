@@ -51,7 +51,7 @@ pub use handshake::{Handshake, HandshakeError, HandshakeStep, Negotiated, Refuse
 pub use hello::Hello;
 pub use interest::{InterestCounters, InterestState, Routing, Target};
 pub use link::{Link, LinkError, LinkHandle, LinkHooks, LinkState};
-pub use node::{MeshConfig, MeshNode};
+pub use node::{MeshConfig, MeshNode, RelayHandler, RelayKind, RelaySendReport};
 pub use queue::PeerQueue;
 pub use swim::{MState, MemberInfo, Membership, MembershipCounters, SwimParams};
 
