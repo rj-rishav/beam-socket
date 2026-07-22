@@ -24,6 +24,8 @@ use tokio::sync::Notify;
 
 use crate::config::LinkConfig;
 use crate::counters::LinkCounters;
+use bytes::Bytes;
+
 use crate::frame::{decode_len, Flags, Frame, FrameError, FrameKind, HEADER_LEN};
 use crate::handshake::{ping_frame, Handshake, Negotiated, RefuseReason, Role};
 use crate::queue::{PeerQueue, PushOutcome};
@@ -148,7 +150,30 @@ impl LinkHandle {
             LinkCounters::add(&self.counters.suppressed_emits, 1);
             return Err(Suppressed(frame.kind));
         }
-        Ok(self.queue.push(frame.encode()))
+        Ok(self.queue.push(Bytes::from(frame.encode())))
+    }
+
+    /// Enqueue a **pre-encoded** frame (a whole `[len][kind][flags][body]` buffer
+    /// as `Bytes`), enforcing sender suppression against `kind`. This is the
+    /// relay hot path (§4.6): the sender builds one frame `Bytes` and hands a
+    /// refcount clone to each interested peer — the payload is not re-encoded per
+    /// peer. `kind` must match the frame's kind byte (the caller built it).
+    pub fn try_send_encoded(
+        &self,
+        kind: FrameKind,
+        frame: Bytes,
+    ) -> Result<PushOutcome, Suppressed> {
+        if !self.negotiated.may_emit(kind) {
+            LinkCounters::add(&self.counters.suppressed_emits, 1);
+            return Err(Suppressed(kind));
+        }
+        Ok(self.queue.push(frame))
+    }
+
+    /// True if this link negotiated the feature that gates `kind` (the node
+    /// checks before building a relay frame for a peer).
+    pub fn may_emit(&self, kind: FrameKind) -> bool {
+        self.negotiated.may_emit(kind)
     }
 
     /// The production send wrapper: a suppression violation is a **bug** in the
@@ -509,7 +534,7 @@ fn dispatch(ctx: &ReaderCtx, kind_byte: u8, flags: u8, body: &[u8]) {
             } else {
                 // Reply with a PONG. It rides the same bounded queue as data; a
                 // dropped PONG just means the peer PINGs again next interval.
-                let _ = ctx.queue.push(ping_frame(true).encode());
+                let _ = ctx.queue.push(Bytes::from(ping_frame(true).encode()));
             }
         }
         // Data-plane frames: hand to the inbound hook if wired (3B's MEMBERSHIP
@@ -569,7 +594,7 @@ async fn keepalive_loop(
                     break;
                 }
                 // Otherwise PING. Control frames are always emittable.
-                if queue.push(ping_frame(false).encode()) == PushOutcome::Enqueued {
+                if queue.push(Bytes::from(ping_frame(false).encode())) == PushOutcome::Enqueued {
                     LinkCounters::add(&counters.pings_sent, 1);
                 }
             }

@@ -11,6 +11,7 @@
 //! wrong crate — see crates/node.
 
 pub mod broadcast;
+pub mod cluster;
 pub mod config;
 pub mod connection;
 pub mod engine;

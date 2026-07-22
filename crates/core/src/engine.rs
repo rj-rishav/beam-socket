@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::broadcast::{broadcast, FanoutReport, FanoutTarget};
+use crate::cluster::{Cluster, NodeConnId, RelayCounters};
 use crate::config::{Config, ConfigError};
 use crate::connection::backpressure::{Mailbox, OutboundFrame, PushOutcome};
 use crate::connection::registry::Registry;
@@ -181,6 +182,9 @@ pub struct Engine {
     rates: Option<Arc<Rates>>,
     shutdown_tx: watch::Sender<bool>,
     listening: Mutex<bool>,
+    /// Phase 3D. `None` = single-node (the default) — no mesh spawned, and the
+    /// relay verbs below short-circuit on this one `Option` check.
+    cluster: Option<Arc<Cluster>>,
 }
 
 impl Engine {
@@ -233,12 +237,33 @@ impl Engine {
             rates
         });
 
+        let registry = Arc::new(Registry::new());
+        let rooms = Arc::new(RoomRegistry::new());
+        let identity = Arc::new(IdentityRegistry::new());
+
+        // Phase 3D: boot the mesh IFF a `cluster` config is present. Single-node
+        // (the default) builds no mesh, spawns no task — the zero-cost contract.
+        let cluster = match &config.cluster {
+            Some(cc) => Some(
+                runtime
+                    .block_on(Cluster::start(
+                        cc,
+                        registry.clone(),
+                        rooms.clone(),
+                        identity.clone(),
+                        metrics.clone(),
+                    ))
+                    .map_err(|e| EngineError::Io(e.to_string()))?,
+            ),
+            None => None,
+        };
+
         Ok((
             Self {
                 runtime: Some(runtime),
-                registry: Arc::new(Registry::new()),
-                rooms: Arc::new(RoomRegistry::new()),
-                identity: Arc::new(IdentityRegistry::new()),
+                registry,
+                rooms,
+                identity,
                 metrics,
                 events,
                 config: Arc::new(config),
@@ -248,6 +273,7 @@ impl Engine {
                 rates,
                 shutdown_tx,
                 listening: Mutex::new(false),
+                cluster,
             },
             rx,
         ))
@@ -330,6 +356,7 @@ impl Engine {
             config: self.config.clone(),
             metrics: self.metrics.clone(),
             events: self.events.clone(),
+            cluster: self.cluster.clone(),
         })
     }
 
@@ -388,18 +415,38 @@ impl Engine {
     /// Join a room (auto-created on first join). Sync JS→Rust call.
     /// `maxRoomsPerConnection` is enforced in `rooms.rs` (Phase 1C).
     pub fn join(&self, id: ConnectionId, room: &str) -> MembershipChange {
-        self.rooms.join(
+        let change = self.rooms.join(
             &self.registry,
             id,
             RoomId(room.to_owned()),
             self.config.limits.max_rooms_per_connection,
-        )
+        );
+        // Edge-triggered interest (§4.3): only the 0→1 transition (this join
+        // created the room / made it non-empty) advertises "I host room r".
+        if let Some(c) = &self.cluster {
+            if change == MembershipChange::Changed
+                && self.rooms.info(&RoomId(room.to_owned())).members == 1
+            {
+                c.set_room_interest(room, true);
+            }
+        }
+        change
     }
 
     /// Leave a room (auto-destroyed on last leave). Sync JS→Rust call.
     pub fn leave(&self, id: ConnectionId, room: &str) -> MembershipChange {
-        self.rooms
-            .leave(&self.registry, id, &RoomId(room.to_owned()))
+        let change = self
+            .rooms
+            .leave(&self.registry, id, &RoomId(room.to_owned()));
+        // 1→0: the room is now gone on this node → withdraw the interest edge.
+        if let Some(c) = &self.cluster {
+            if change == MembershipChange::Changed
+                && self.rooms.info(&RoomId(room.to_owned())).members == 0
+            {
+                c.set_room_interest(room, false);
+            }
+        }
+        change
     }
 
     /// One FFI call per broadcast; the payload is ONE allocation, cloned by
@@ -411,15 +458,32 @@ impl Engine {
         is_binary: bool,
         except: &[ConnectionId],
     ) -> FanoutReport {
-        broadcast(
-            &self.registry,
-            &self.rooms,
-            &self.identity,
-            FanoutTarget::Room(&RoomId(room.to_owned())),
-            data,
-            is_binary,
-            except,
-        )
+        // Single-node (the common case): the local fan-out is bit-identical to
+        // pre-3D — `data` is moved in, no clone, no branch beyond this `match`.
+        match &self.cluster {
+            None => broadcast(
+                &self.registry,
+                &self.rooms,
+                &self.identity,
+                FanoutTarget::Room(&RoomId(room.to_owned())),
+                data,
+                is_binary,
+                except,
+            ),
+            Some(c) => {
+                let report = broadcast(
+                    &self.registry,
+                    &self.rooms,
+                    &self.identity,
+                    FanoutTarget::Room(&RoomId(room.to_owned())),
+                    data.clone(), // refcount bump — same allocation as the relay source
+                    is_binary,
+                    except,
+                );
+                c.relay_room(room, &data, is_binary, &node_excepts(c.node_id(), except));
+                report
+            }
+        }
     }
 
     /// Broadcast to every live connection.
@@ -429,15 +493,30 @@ impl Engine {
         is_binary: bool,
         except: &[ConnectionId],
     ) -> FanoutReport {
-        broadcast(
-            &self.registry,
-            &self.rooms,
-            &self.identity,
-            FanoutTarget::All,
-            data,
-            is_binary,
-            except,
-        )
+        match &self.cluster {
+            None => broadcast(
+                &self.registry,
+                &self.rooms,
+                &self.identity,
+                FanoutTarget::All,
+                data,
+                is_binary,
+                except,
+            ),
+            Some(c) => {
+                let report = broadcast(
+                    &self.registry,
+                    &self.rooms,
+                    &self.identity,
+                    FanoutTarget::All,
+                    data.clone(),
+                    is_binary,
+                    except,
+                );
+                c.relay_all(&data, is_binary, &node_excepts(c.node_id(), except));
+                report
+            }
+        }
     }
 
     // ── Phase 1C: identity ──
@@ -452,15 +531,83 @@ impl Engine {
         is_binary: bool,
         except: &[ConnectionId],
     ) -> FanoutReport {
-        broadcast(
-            &self.registry,
-            &self.rooms,
-            &self.identity,
-            FanoutTarget::User(&UserId(user_id.to_owned())),
-            data,
-            is_binary,
-            except,
-        )
+        match &self.cluster {
+            None => broadcast(
+                &self.registry,
+                &self.rooms,
+                &self.identity,
+                FanoutTarget::User(&UserId(user_id.to_owned())),
+                data,
+                is_binary,
+                except,
+            ),
+            Some(c) => {
+                let report = broadcast(
+                    &self.registry,
+                    &self.rooms,
+                    &self.identity,
+                    FanoutTarget::User(&UserId(user_id.to_owned())),
+                    data.clone(),
+                    is_binary,
+                    except,
+                );
+                c.relay_user(
+                    user_id,
+                    &data,
+                    is_binary,
+                    &node_excepts(c.node_id(), except),
+                );
+                report
+            }
+        }
+    }
+
+    // ── Phase 3D: cluster ──
+
+    /// True when a `cluster` config was supplied (a mesh is running).
+    pub fn is_clustered(&self) -> bool {
+        self.cluster.is_some()
+    }
+
+    /// The cluster handle, when clustered — for `stats()` and the relay verbs.
+    pub fn cluster(&self) -> Option<&Arc<Cluster>> {
+        self.cluster.as_ref()
+    }
+
+    /// `toSocket(id)` for a node-scoped id: **local** when it names this node,
+    /// else relayed to the owning node only (§4.5). Unclustered or local → the
+    /// existing single-socket `send`.
+    pub fn send_node(&self, target: NodeConnId, data: bytes::Bytes, is_binary: bool) -> SendStatus {
+        match &self.cluster {
+            Some(c) if target.node != c.node_id() => {
+                c.relay_socket(target, &data, is_binary);
+                SendStatus::Queued // best-effort cross-node, 1C currency
+            }
+            _ => self.send(target.local, data, is_binary),
+        }
+    }
+
+    /// `stats().cluster` fields (absent when single-node). `(nodeId, peerCount,
+    /// relayIn, relayOut, relayDrops)`.
+    pub fn cluster_summary(&self) -> Option<(u16, usize, u64, u64, u64)> {
+        self.cluster.as_ref().map(|c| {
+            let r = c.relay_counters();
+            (
+                c.node_id(),
+                c.mesh().peer_count(),
+                RelayCounters::get(&r.relay_in),
+                RelayCounters::get(&r.relay_out),
+                RelayCounters::get(&r.relay_drops),
+            )
+        })
+    }
+
+    /// Per-peer `(nodeId, pressure)` for `stats().cluster.peers[]` (§4.6).
+    pub fn cluster_peer_pressures(&self) -> Vec<(u16, f64)> {
+        self.cluster
+            .as_ref()
+            .map(|c| c.mesh().peer_pressures())
+            .unwrap_or_default()
     }
 
     /// JS replied to an `authorize` request (the `resolveAuthorize` command).
@@ -970,6 +1117,17 @@ async fn setup_connection<T: Transport>(
 /// connection, clean up. Both producers converge here: `accept` (own-port) and
 /// `adopt` (attach, RFC 0002 §5). Generic over the frame halves; both paths hand
 /// in `WsSink`/`WsSource`.
+/// Map local `except` ids to node-scoped ids for a relay: they name *this*
+/// node's connections (the engine verb took local ids), so a remote node
+/// ignores them — but they still suppress the sender's own would-be duplicate
+/// when the payload loops back through an interest overlap.
+fn node_excepts(node: u16, except: &[ConnectionId]) -> Vec<NodeConnId> {
+    except
+        .iter()
+        .map(|id| NodeConnId { node, local: *id })
+        .collect()
+}
+
 async fn run_admitted<Snk, Src>(
     accepted: Accepted<Snk, Src>,
     ctx: Arc<ConnCtx>,
@@ -1033,6 +1191,13 @@ async fn run_admitted<Snk, Src>(
     // device immediately. Unbound below on disconnect.
     if let Some(uid) = &user_id {
         identity.bind(uid.clone(), id);
+        // Edge-triggered interest (§4.3): first device of this user on this node
+        // → advertise "I host user u".
+        if let Some(c) = &ctx.cluster {
+            if identity.device_count(uid) == 1 {
+                c.set_user_interest(&uid.0, true);
+            }
+        }
     }
 
     run_connection(
@@ -1050,11 +1215,25 @@ async fn run_admitted<Snk, Src>(
     // Bidirectional membership cleanup: the entry (and its room set) comes
     // out first, so no join can race the sweep — O(rooms) per §6.
     if let Some((_, joined)) = registry.remove_full(id) {
-        rooms.disconnect_cleanup(id, joined);
+        rooms.disconnect_cleanup(id, joined.clone());
+        // 1→0 interest withdrawal for any room this disconnect emptied (§4.3).
+        if let Some(c) = &ctx.cluster {
+            for room in &joined {
+                if rooms.info(room).members == 0 {
+                    c.set_room_interest(&room.0, false);
+                }
+            }
+        }
     }
     // Unbind identity (auto-destroys the user entry on its last device).
     if let Some(uid) = &user_id {
         identity.unbind(uid, id);
+        // 1→0: last device of this user on this node → withdraw the interest.
+        if let Some(c) = &ctx.cluster {
+            if identity.device_count(uid) == 0 {
+                c.set_user_interest(&uid.0, false);
+            }
+        }
     }
     Metrics::sub(&ctx.metrics.connections, 1);
 }
