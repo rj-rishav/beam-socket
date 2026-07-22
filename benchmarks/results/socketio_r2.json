@@ -1,0 +1,39 @@
+{
+  "lib": "socketio",
+  "node": "v20.19.5",
+  "ts": "2026-07-22T10:01:32.471Z",
+  "throughput": {
+    "conns": 8,
+    "seconds": 3,
+    "msgsPerSec": 47713
+  },
+  "latency": {
+    "samples": 2000,
+    "p50ms": 3.017,
+    "p99ms": 8.051,
+    "meanms": 3.519
+  },
+  "fanout": {
+    "1000": {
+      "recipients": 1000,
+      "bestMs": 23.06,
+      "medianMs": 34.68
+    },
+    "3000": {
+      "recipients": 3000,
+      "bestMs": 71.54,
+      "medianMs": 88.89
+    },
+    "5000": {
+      "recipients": 5000,
+      "bestMs": 125.37,
+      "medianMs": 145.97
+    }
+  },
+  "memory": {
+    "conns": 3000,
+    "baseRssKB": 170724,
+    "loadedRssKB": 198392,
+    "bytesPerConn": 9444
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "lib": "uws",
+  "node": "v20.19.5",
+  "ts": "2026-07-22T10:01:22.151Z",
+  "throughput": {
+    "conns": 8,
+    "seconds": 3,
+    "msgsPerSec": 164880
+  },
+  "latency": {
+    "samples": 2000,
+    "p50ms": 0.971,
+    "p99ms": 2.872,
+    "meanms": 1.078
+  },
+  "fanout": {
+    "1000": {
+      "recipients": 1000,
+      "bestMs": 6.65,
+      "medianMs": 8.74
+    },
+    "3000": {
+      "recipients": 3000,
+      "bestMs": 20.41,
+      "medianMs": 22.52
+    },
+    "5000": {
+      "recipients": 5000,
+      "bestMs": 33.82,
+      "medianMs": 36.09
+    }
+  },
+  "memory": {
+    "conns": 3000,
+    "baseRssKB": 56680,
+    "loadedRssKB": 56680,
+    "bytesPerConn": 0
+  }
+}
