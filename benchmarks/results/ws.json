@@ -1,0 +1,39 @@
+{
+  "lib": "ws",
+  "node": "v20.19.5",
+  "ts": "2026-07-22T09:59:10.957Z",
+  "throughput": {
+    "conns": 8,
+    "seconds": 3,
+    "msgsPerSec": 175753
+  },
+  "latency": {
+    "samples": 2000,
+    "p50ms": 1.006,
+    "p99ms": 3.129,
+    "meanms": 1.118
+  },
+  "fanout": {
+    "1000": {
+      "recipients": 1000,
+      "bestMs": 8.75,
+      "medianMs": 9.53
+    },
+    "3000": {
+      "recipients": 3000,
+      "bestMs": 22.8,
+      "medianMs": 28.31
+    },
+    "5000": {
+      "recipients": 5000,
+      "bestMs": 38.58,
+      "medianMs": 44.63
+    }
+  },
+  "memory": {
+    "conns": 3000,
+    "baseRssKB": 110680,
+    "loadedRssKB": 116140,
+    "bytesPerConn": 1864
+  }
+}
