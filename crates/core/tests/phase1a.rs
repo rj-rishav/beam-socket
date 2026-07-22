@@ -122,6 +122,7 @@ async fn panicking_connection_task_is_contained() {
         config: Arc::new(Config::default()),
         metrics,
         events,
+        cluster: None, // 3D: single-node harness (mechanical field add, no behavior change)
     });
 
     let doomed = spawn_mock_conn(1, ctx.clone());
@@ -211,6 +212,7 @@ async fn keepalive_pings_and_times_out_dead_peer() {
         config: Arc::new(config),
         metrics,
         events,
+        cluster: None, // 3D: single-node harness (mechanical field add, no behavior change)
     });
 
     let mut conn = spawn_mock_conn(9, ctx);

@@ -22,16 +22,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
 use crate::config::{Backoff, LinkConfig};
-use crate::frame::{Frame, FrameKind};
+use crate::frame::{Flags, Frame, FrameKind};
 use crate::handshake::features;
 use crate::interest::{self, InterestCounters, InterestState, InterestUpdate, Routing, Target};
 use crate::link::{CloseHandler, InboundHandler, Link, LinkHandle, LinkHooks};
 use crate::membership_sync::{self, MembershipMsg};
 use crate::probe::{ProbeCounters, ProbePlane};
+use crate::queue::PushOutcome;
 use crate::swim::{MState, MemberInfo, Membership, MembershipCounters, SwimParams};
 
 /// How often the node dials missing peers, spreads gossip, and (a tenth as
@@ -40,6 +42,57 @@ use crate::swim::{MState, MemberInfo, Membership, MembershipCounters, SwimParams
 const DIAL_INTERVAL: Duration = Duration::from_millis(300);
 const GOSSIP_INTERVAL: Duration = Duration::from_millis(300);
 const DIGEST_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Which targeting verb a relayed frame carries (§4.3). The mesh moves the
+/// bytes; **core owns the body format and the local fan-out** — the mesh never
+/// interprets a relay payload (it carries frames, not state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayKind {
+    Room,
+    User,
+    All,
+    Socket,
+}
+
+impl RelayKind {
+    fn frame_kind(self) -> FrameKind {
+        match self {
+            RelayKind::Room => FrameKind::RelayRoom,
+            RelayKind::User => FrameKind::RelayUser,
+            RelayKind::All => FrameKind::RelayAll,
+            RelayKind::Socket => FrameKind::RelaySocket,
+        }
+    }
+    fn from_frame_kind(k: FrameKind) -> Option<RelayKind> {
+        Some(match k {
+            FrameKind::RelayRoom => RelayKind::Room,
+            FrameKind::RelayUser => RelayKind::User,
+            FrameKind::RelayAll => RelayKind::All,
+            FrameKind::RelaySocket => RelayKind::Socket,
+            _ => return None,
+        })
+    }
+}
+
+/// Called when a RELAY_* frame arrives, with `(kind, is_binary, body)`. Core's
+/// [`crate::node`] consumer decodes the body and fans out to **local** recipients
+/// only — a received relay is **never re-forwarded** (loop prevention, §4.3).
+/// Runs on the link reader task; keep it cheap.
+pub type RelayHandler = Arc<dyn Fn(RelayKind, bool, Vec<u8>) + Send + Sync>;
+
+/// The result of relaying one frame to a set of peers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RelaySendReport {
+    /// Peers the frame was enqueued to.
+    pub sent: u64,
+    /// Peers whose bounded queue was full (drop-and-count, §4.6).
+    pub dropped: u64,
+    /// Peers whose link had not negotiated the RELAY feature (suppressed).
+    pub suppressed: u64,
+    /// Interested peers with **no live link** — unreachable (a partition in
+    /// flight). Dropped-and-counted, no queue-and-forward (1C currency, §13.4).
+    pub no_link: u64,
+}
 
 /// Config for one mesh node (the link-layer view of §5's `cluster` block).
 #[derive(Debug, Clone)]
@@ -83,14 +136,18 @@ struct Inner {
     dial_backoff: Mutex<HashMap<SocketAddr, (u32, Instant)>>,
     backoff: Backoff,
     shutdown: AtomicBool,
+    /// Set by core (3D) to receive RELAY_* frames for local fan-out. `None` for
+    /// a pure-membership node (3B/3C tests).
+    relay_handler: Option<RelayHandler>,
 }
 
 impl Inner {
     fn link_cfg(&self) -> LinkConfig {
         let mut c = LinkConfig::new(self.self_id, self.cluster_name.clone(), self.secret.clone());
-        // Advertise interest routing so INTEREST/INTEREST_DIGEST frames pass the
-        // 3A feature-intersection + sender-suppression checks on the link.
-        c.features = features::INTEREST_ROUTING;
+        // Advertise interest routing + relay so INTEREST/INTEREST_DIGEST and
+        // RELAY_* frames pass the 3A feature-intersection + sender-suppression
+        // checks on the link.
+        c.features = features::INTEREST_ROUTING | features::RELAY;
         c
     }
 
@@ -160,6 +217,18 @@ impl Inner {
                 let snaps = self.interest.lock().unwrap().respond_to_digest(&digest);
                 for s in snaps {
                     self.send_interest(peer, &InterestUpdate::Snapshot(s));
+                }
+            }
+            FrameKind::RelayRoom
+            | FrameKind::RelayUser
+            | FrameKind::RelayAll
+            | FrameKind::RelaySocket => {
+                // Hand to core for LOCAL fan-out. The mesh never re-forwards a
+                // received relay (loop prevention, §4.3) — there is no send here.
+                if let (Some(h), Some(kind)) =
+                    (&self.relay_handler, RelayKind::from_frame_kind(frame.kind))
+                {
+                    h(kind, frame.flags.has(Flags::BINARY), frame.body.clone());
                 }
             }
             _ => {}
@@ -302,7 +371,18 @@ pub struct MeshNode {
 }
 
 impl MeshNode {
+    /// Start a node with no relay handler (a pure membership/interest node — the
+    /// 3B/3C tests). 3D uses [`MeshNode::start_with_relay`].
     pub async fn start(config: MeshConfig) -> std::io::Result<Arc<MeshNode>> {
+        Self::start_with_relay(config, None).await
+    }
+
+    /// Start a node, registering `relay_handler` to receive RELAY_* frames for
+    /// local fan-out (3D). The mesh carries the frames; core owns the payload.
+    pub async fn start_with_relay(
+        config: MeshConfig,
+        relay_handler: Option<RelayHandler>,
+    ) -> std::io::Result<Arc<MeshNode>> {
         // Bind UDP first so we can bind TCP to the same (possibly :0-resolved)
         // port — peers reach both planes at one address.
         let udp = Arc::new(UdpSocket::bind(config.listen).await?);
@@ -338,6 +418,7 @@ impl MeshNode {
             dial_backoff: Mutex::new(HashMap::new()),
             backoff: Backoff::default(),
             shutdown: AtomicBool::new(false),
+            relay_handler,
         });
 
         let tasks = vec![
@@ -421,6 +502,75 @@ impl MeshNode {
     /// Flip the routing lever at runtime (interest ⇄ flood).
     pub fn set_routing(&self, routing: Routing) {
         self.inner.interest.lock().unwrap().set_routing(routing);
+    }
+
+    // ── relay send (3D) ──
+
+    /// Build a RELAY frame **once** (`[len][kind][flags][metadata][payload]`) and
+    /// refcount-clone it to each of `peers` (§4.6 serialize-once across the hop):
+    /// the **payload is copied exactly once** into the frame `Bytes`, then only
+    /// its refcount is bumped per peer. `metadata` is the small per-verb prefix
+    /// (room/user name, except list) core assembled; `payload` is the app
+    /// message the SDK serialized once. A peer with no link, a full queue, or no
+    /// RELAY feature is tallied, never fatal.
+    pub fn relay(
+        &self,
+        peers: &[u16],
+        kind: RelayKind,
+        is_binary: bool,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> RelaySendReport {
+        let frame_kind = kind.frame_kind();
+        let flags = if is_binary { Flags::BINARY } else { 0 };
+        let body_len = metadata.len() + payload.len();
+        let mut buf = Vec::with_capacity(6 + body_len);
+        let len = (2 + body_len) as u32;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.push(frame_kind.as_u8());
+        buf.push(flags);
+        buf.extend_from_slice(metadata);
+        buf.extend_from_slice(payload);
+        let frame = Bytes::from(buf);
+
+        // Snapshot each peer's handle (or None if unreachable), drop the links
+        // lock, then enqueue (never hold two locks across the pushes).
+        let handles: Vec<Option<LinkHandle>> = {
+            let links = self.inner.links.lock().unwrap();
+            peers.iter().map(|p| links.get(p).cloned()).collect()
+        };
+        let mut report = RelaySendReport::default();
+        for h in handles {
+            match h {
+                None => report.no_link += 1,
+                Some(h) => match h.try_send_encoded(frame_kind, frame.clone()) {
+                    Ok(PushOutcome::Enqueued) => report.sent += 1,
+                    Ok(PushOutcome::Dropped) => report.dropped += 1,
+                    Err(_) => report.suppressed += 1,
+                },
+            }
+        }
+        report
+    }
+
+    /// Current peer count (Alive links) — a `stats().cluster` field.
+    pub fn peer_count(&self) -> usize {
+        self.inner.links.lock().unwrap().len()
+    }
+
+    /// `(nodeId, pressure)` for each live link — the §4.6 per-peer gauge for
+    /// `stats().cluster.peers[]`.
+    pub fn peer_pressures(&self) -> Vec<(u16, f64)> {
+        let mut v: Vec<(u16, f64)> = self
+            .inner
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, h)| (*id, h.pressure()))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
     }
 
     /// Inject a partition: deny `peers` — drop their UDP, sever their TCP links,

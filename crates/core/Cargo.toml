@@ -18,7 +18,14 @@ dashmap = "6"
 # Phase 1C (trustProxy CIDR parsing + membership, IPv4+IPv6). Small and
 # dependency-light — ARCHITECTURE §4 allows "an ipnet-class crate".
 ipnet = "2"
+# Phase 3D: the cluster mesh. Core depends on it behind the Engine facade,
+# exactly where RFC 0004 attaches — and only exercised when `cluster` config is
+# present (single-node builds link it but spawn nothing).
+beamsocket-mesh = { path = "../mesh" }
 
 [dev-dependencies]
 proptest = "1" # Phase 1B membership property tests
 # criterion = "0.5"   # micro-benchmarks
+# Phase 3D gate tests reach the mesh's `RelayKind` directly for the partition
+# drop-accounting assertion (already a normal dep of this crate).
+beamsocket-mesh = { path = "../mesh" }

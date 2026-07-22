@@ -136,6 +136,9 @@ pub struct ConnCtx {
     pub config: Arc<Config>,
     pub metrics: Arc<Metrics>,
     pub events: EventSender,
+    /// Phase 3D: the cluster, when clustered. `None` = single-node — the
+    /// connection lifecycle's interest hooks (`run_admitted`) are then no-ops.
+    pub cluster: Option<Arc<crate::cluster::Cluster>>,
 }
 
 /// Drive one connection to completion: emit Opened, run writer + reader,
