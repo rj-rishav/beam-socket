@@ -13,8 +13,13 @@ whole per-message data plane stays off the JS event loop. Phase 0 gate met: RFC
 (runtime maturity) is complete and merged**: the full observability read surface
 (`stats`, `topRooms`, `backpressureReport`, `memoryUsage`, Prometheus export —
 zero hot-path cost, proven) plus the admin verbs (`disconnectSocket`,
-`disconnectUser`, `closeRoom`). **Phase 3 (cluster mesh) is in progress** — RFC 0004 is FROZEN (soak-conditional) and implementation follows ENGINEERING §13 (3A–3D)
-— see [ENGINEERING.md §12](docs/ENGINEERING.md).
+`disconnectUser`, `closeRoom`). **Phase 3 (cluster mesh) is COMPLETE and merged**:
+`crates/mesh` (link layer + SWIM membership + interest routing) wired into the
+engine — `toRoom`/`toUser`/`broadcast`/`toSocket` reach members across nodes,
+payload serialized once across the hop, interest routing ~40× lighter than flood,
+and single-node mode proven zero-cost (no mesh spawned, ~405 ns/verb, the 112
+pre-mesh tests unchanged). Rust core: 166 tests. See
+[ENGINEERING.md §13](docs/ENGINEERING.md).
 
 **Release blockers before the alpha goes public** (need real hardware /
 credentials, not closable in a sandbox): pinned-box bridge-constant
