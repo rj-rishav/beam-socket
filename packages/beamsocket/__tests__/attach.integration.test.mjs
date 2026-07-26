@@ -272,6 +272,16 @@ test('attach_fd_hygiene_no_leak_no_double_close — churn accept + per-IP reject
       return -1;
     }
   };
+  // The per-IP slot releases during async server-side teardown, which can lag
+  // the client's `close` event. Wait for the server to actually report the
+  // connection gone before the next accept, or a cap-of-1 accept races the
+  // prior slot's release and is itself 429'd (a test race, not an engine bug).
+  const waitDrained = async () => {
+    for (let i = 0; i < 200; i++) {
+      if (io.connectionCount() === 0) return;
+      await sleep(10);
+    }
+  };
   // Open (accepted), then a concurrent 2nd → rejected (429), then close both.
   const acceptThenReject = async () => {
     const a = new WebSocket(`ws://127.0.0.1:${port}/ws`);
@@ -284,6 +294,7 @@ test('attach_fd_hygiene_no_leak_no_double_close — churn accept + per-IP reject
     });
     a.close();
     await once(a, 'close');
+    await waitDrained();
     return rejected;
   };
 
