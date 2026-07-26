@@ -3,7 +3,7 @@
 //   node scripts/stage-prebuild.mjs <target-triple>
 import { copyFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // target triple → [npm dir, napi node filename, cargo library filename]
 export const TARGETS = {
@@ -16,7 +16,11 @@ export const TARGETS = {
   'x86_64-pc-windows-msvc': ['win32-x64-msvc', 'beamsocket.win32-x64-msvc.node', 'beamsocket_node.dll'],
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Robust "run as a script?" check — `file://${argv[1]}` breaks on Windows
+// (backslashes + drive letter don't match import.meta.url's file:///D:/… form),
+// which silently skipped staging and produced an empty artifact. pathToFileURL
+// normalizes both sides on every OS.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const target = process.argv[2];
   const entry = TARGETS[target];
   if (!entry) {
