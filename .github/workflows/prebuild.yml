@@ -20,11 +20,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl }
-          - { os: macos-14, target: aarch64-apple-darwin }
+          # NATIVE builds only — each target compiles on its own native runner,
+          # so there is NO cross-compilation and no cross-linker config to get
+          # wrong. Covers the platforms ~all Node developers use. arm64-linux and
+          # musl (Alpine) are a deliberate later addition — they need cross
+          # toolchains or arm runners and are not worth blocking the alpha on.
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: macos-13,       target: x86_64-apple-darwin }
+          - { os: macos-14,       target: aarch64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +36,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # cross-linkers for the targets that need them (arm64 / musl on ubuntu).
-      - name: Install cross toolchain (linux arm64/musl)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu || true
       - run: npm ci --workspaces --include-workspace-root
       - name: Build addon
         run: cargo build -p beamsocket-node --release --features napi --target ${{ matrix.target }}
@@ -75,6 +72,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for dir in packages/beamsocket/npm/*/; do
+            ls "$dir"*.node >/dev/null 2>&1 || { echo "skip $dir — no binary staged for this release"; continue; }
             npm publish "$dir" --access public --tag alpha || exit 1
           done
           npm publish packages/beamsocket --access public --tag alpha

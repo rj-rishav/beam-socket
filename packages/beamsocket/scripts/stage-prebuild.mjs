@@ -11,6 +11,7 @@ export const TARGETS = {
   'x86_64-unknown-linux-musl': ['linux-x64-musl', 'beamsocket.linux-x64-musl.node', 'libbeamsocket_node.so'],
   'aarch64-unknown-linux-gnu': ['linux-arm64-gnu', 'beamsocket.linux-arm64-gnu.node', 'libbeamsocket_node.so'],
   'aarch64-unknown-linux-musl': ['linux-arm64-musl', 'beamsocket.linux-arm64-musl.node', 'libbeamsocket_node.so'],
+  'x86_64-apple-darwin': ['darwin-x64', 'beamsocket.darwin-x64.node', 'libbeamsocket_node.dylib'],
   'aarch64-apple-darwin': ['darwin-arm64', 'beamsocket.darwin-arm64.node', 'libbeamsocket_node.dylib'],
   'x86_64-pc-windows-msvc': ['win32-x64-msvc', 'beamsocket.win32-x64-msvc.node', 'beamsocket_node.dll'],
 };
