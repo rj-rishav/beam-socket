@@ -1,0 +1,11 @@
+{
+  "name": "beamsocket-darwin-x64",
+  "version": "0.1.0-alpha.0",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "main": "beamsocket.darwin-x64.node",
+  "files": ["beamsocket.darwin-x64.node"],
+  "description": "Prebuilt beamsocket native addon for darwin-x64.",
+  "license": "MIT",
+  "engines": { "node": ">= 18" }
+}

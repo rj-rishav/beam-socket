@@ -26,9 +26,7 @@
   },
   "optionalDependencies": {
     "beamsocket-linux-x64-gnu": "0.1.0-alpha.0",
-    "beamsocket-linux-x64-musl": "0.1.0-alpha.0",
-    "beamsocket-linux-arm64-gnu": "0.1.0-alpha.0",
-    "beamsocket-linux-arm64-musl": "0.1.0-alpha.0",
+    "beamsocket-darwin-x64": "0.1.0-alpha.0",
     "beamsocket-darwin-arm64": "0.1.0-alpha.0",
     "beamsocket-win32-x64-msvc": "0.1.0-alpha.0"
   },
