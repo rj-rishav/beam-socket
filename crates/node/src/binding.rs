@@ -504,69 +504,6 @@ impl BeamEngine {
 
     /// The (connectionId halves, userId) pairs of a room's live members — ONE
     /// FFI call. The SDK joins metadata (which lives in JS) per entry.
-    /// **Phase 1.1 attach (RFC 0002 §4).** `dup()` the Node upgrade fd, adopt it
-    /// on the engine runtime, and return Accepted / Rejected(status). Unix only
-    /// (Windows fd handoff is deferred, §7 — the SDK throws before calling this
-    /// on Windows). `headers_flat` is `[k0,v0,k1,v1,…]`.
-    #[cfg(unix)]
-    #[napi]
-    pub fn attach(
-        &self,
-        fd: i32,
-        remote_addr: String,
-        method: String,
-        url: String,
-        headers_flat: Vec<String>,
-        head: Buffer,
-    ) -> Result<JsAttachResult> {
-        let engine = self.engine()?;
-        let peer: std::net::IpAddr = remote_addr
-            .parse()
-            .map_err(|_| Error::from_reason(format!("attach: bad remoteAddr {remote_addr:?}")))?;
-        // Flat [k0,v0,k1,v1,…] → (lowercased key, value) pairs (same shape the
-        // own-port handshake captures).
-        let mut headers = Vec::with_capacity(headers_flat.len() / 2);
-        for pair in headers_flat.chunks_exact(2) {
-            headers.push((pair[0].to_ascii_lowercase(), pair[1].clone()));
-        }
-        let parsed = ParsedUpgrade {
-            method,
-            url,
-            headers,
-        };
-        let head = bytes::Bytes::from(head.to_vec());
-
-        // dup → RAII guard (closes the dup on any early bail) → hand ownership to
-        // a std TcpStream → engine (§9). All validation above happens BEFORE the
-        // dup, so a malformed request never leaks an fd.
-        let dup = unsafe { libc::dup(fd) };
-        if dup < 0 {
-            return Ok(JsAttachResult {
-                accepted: false,
-                status: 500.0,
-            });
-        }
-        let guard = FdHandoffGuard::new(dup);
-        let std_stream = guard.into_std_stream(); // disarm + ownership transfer
-        if std_stream.set_nonblocking(true).is_err() {
-            // std_stream drops here → closes the fd; no leak, no double close.
-            return Ok(JsAttachResult {
-                accepted: false,
-                status: 500.0,
-            });
-        }
-        Ok(match engine.attach(std_stream, peer, parsed, head) {
-            AttachOutcome::Accepted => JsAttachResult {
-                accepted: true,
-                status: 0.0,
-            },
-            AttachOutcome::Rejected(s) => JsAttachResult {
-                accepted: false,
-                status: s as f64,
-            },
-        })
-    }
-
     #[napi]
     pub fn presence_list(&self, room: String) -> Result<Vec<JsPresenceEntry>> {
         let engine = self.engine()?;
@@ -781,6 +718,77 @@ impl BeamEngine {
         self.engine
             .as_ref()
             .ok_or_else(|| Error::from_reason("engine already shut down"))
+    }
+}
+
+// Phase 1.1 attach lives in its OWN `#[cfg(unix)] #[napi] impl` block. A
+// per-method `#[cfg(unix)]` inside the shared impl does NOT strip the napi
+// registration glue (`__napi__attach`) the macro generates, so on Windows that
+// glue dangles → `error[E0425]: cannot find value __napi__attach`. Gating the
+// whole impl block removes the block — glue included — before the macro runs.
+#[cfg(unix)]
+#[napi]
+impl BeamEngine {
+    /// **Phase 1.1 attach (RFC 0002 §4).** `dup()` the Node upgrade fd, adopt it
+    /// on the engine runtime, and return Accepted / Rejected(status). Unix only
+    /// (Windows fd handoff is deferred, §7 — the SDK throws before calling this
+    /// on Windows). `headers_flat` is `[k0,v0,k1,v1,…]`.
+    #[napi]
+    pub fn attach(
+        &self,
+        fd: i32,
+        remote_addr: String,
+        method: String,
+        url: String,
+        headers_flat: Vec<String>,
+        head: Buffer,
+    ) -> Result<JsAttachResult> {
+        let engine = self.engine()?;
+        let peer: std::net::IpAddr = remote_addr
+            .parse()
+            .map_err(|_| Error::from_reason(format!("attach: bad remoteAddr {remote_addr:?}")))?;
+        // Flat [k0,v0,k1,v1,…] → (lowercased key, value) pairs (same shape the
+        // own-port handshake captures).
+        let mut headers = Vec::with_capacity(headers_flat.len() / 2);
+        for pair in headers_flat.chunks_exact(2) {
+            headers.push((pair[0].to_ascii_lowercase(), pair[1].clone()));
+        }
+        let parsed = ParsedUpgrade {
+            method,
+            url,
+            headers,
+        };
+        let head = bytes::Bytes::from(head.to_vec());
+
+        // dup → RAII guard (closes the dup on any early bail) → hand ownership to
+        // a std TcpStream → engine (§9). All validation above happens BEFORE the
+        // dup, so a malformed request never leaks an fd.
+        let dup = unsafe { libc::dup(fd) };
+        if dup < 0 {
+            return Ok(JsAttachResult {
+                accepted: false,
+                status: 500.0,
+            });
+        }
+        let guard = FdHandoffGuard::new(dup);
+        let std_stream = guard.into_std_stream(); // disarm + ownership transfer
+        if std_stream.set_nonblocking(true).is_err() {
+            // std_stream drops here → closes the fd; no leak, no double close.
+            return Ok(JsAttachResult {
+                accepted: false,
+                status: 500.0,
+            });
+        }
+        Ok(match engine.attach(std_stream, peer, parsed, head) {
+            AttachOutcome::Accepted => JsAttachResult {
+                accepted: true,
+                status: 0.0,
+            },
+            AttachOutcome::Rejected(s) => JsAttachResult {
+                accepted: false,
+                status: s as f64,
+            },
+        })
     }
 }
 
