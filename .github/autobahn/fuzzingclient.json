@@ -1,5 +1,5 @@
 {
-  "outdir": "./reports",
+  "outdir": "/config/reports",
   "servers": [
     { "agent": "beamsocket", "url": "ws://127.0.0.1:9001" }
   ],
