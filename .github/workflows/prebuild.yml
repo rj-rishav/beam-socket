@@ -73,8 +73,23 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # Idempotent: skip any name@version already on the registry, so a
+          # re-run after a mid-publish failure doesn't die on packages that
+          # already went up. Use an explicit ./ path so npm treats the argument
+          # as a directory — a bare `packages/beamsocket` is parsed as a GitHub
+          # `owner/repo` shorthand and triggers a git ls-remote (the E128).
+          publish_if_new() {
+            dir="${1%/}"
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "skip (already published): $name@$ver"
+            else
+              npm publish "./$dir" --access public --tag alpha
+            fi
+          }
           for dir in packages/beamsocket/npm/*/; do
-            ls "$dir"*.node >/dev/null 2>&1 || { echo "skip $dir — no binary staged for this release"; continue; }
-            npm publish "$dir" --access public --tag alpha || exit 1
+            ls "$dir"*.node >/dev/null 2>&1 || { echo "skip $dir — no binary staged"; continue; }
+            publish_if_new "$dir"
           done
-          npm publish packages/beamsocket --access public --tag alpha
+          publish_if_new packages/beamsocket
