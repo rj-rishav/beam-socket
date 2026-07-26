@@ -26,9 +26,11 @@ jobs:
           # musl (Alpine) are a deliberate later addition — they need cross
           # toolchains or arm runners and are not worth blocking the alpha on.
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { os: macos-13,       target: x86_64-apple-darwin }
           - { os: macos-14,       target: aarch64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          # Intel-Mac (macos-13 / x86_64-apple-darwin) dropped for now — its
+          # runners were stalling in the allocation queue and hanging whole
+          # runs. Apple-Silicon (arm64) covers most Macs; add x64 back later.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
