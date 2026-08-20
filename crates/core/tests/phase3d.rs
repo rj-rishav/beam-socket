@@ -28,12 +28,15 @@ use beamsocket_core::connection::backpressure::{Mailbox, OutboundFrame};
 use beamsocket_core::connection::registry::Registry;
 use beamsocket_core::connection::{CloseSignal, ConnHandle, Control, CONTROL_QUEUE_CAPACITY};
 use beamsocket_core::engine::Engine;
+use beamsocket_core::events::EngineEvent;
 use beamsocket_core::identity::IdentityRegistry;
 use beamsocket_core::ids::{ConnectionId, RoomId, UserId};
 use beamsocket_core::metrics::Metrics;
 use beamsocket_core::rooms::RoomRegistry;
 
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
 
 const SECRET: &[u8] = b"cluster-secret";
 
@@ -462,6 +465,143 @@ async fn partition_delivery_is_1c_currency_no_queue_and_forward() {
         0,
         "the partition-time message was never buffered (no queue-and-forward)"
     );
+}
+
+/// Wait for the next `ConnectionOpened` on an engine's event stream (test
+/// wiring only — the real bridge in crates/node does the equivalent).
+async fn wait_for_open(rx: &mut mpsc::Receiver<EngineEvent>, timeout: Duration) -> ConnectionId {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match rx.recv().await.expect("event channel closed") {
+                EngineEvent::ConnectionOpened { id, .. } => return id,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ConnectionOpened")
+}
+
+/// `Engine::broadcast_room`'s `remote_except` parameter, driven directly at
+/// the real facade (docs/prs/v0.2.0-cluster-js.md flags this as owed: the
+/// e2e test above goes through `Node::to_room`, a hand-rolled replica that
+/// builds correctly-tagged `NodeConnId` excepts and hands them straight to
+/// `Cluster::relay_room` — it never calls `Engine::broadcast_room` itself,
+/// which is the only path real callers (crates/node, and therefore every JS
+/// app) actually go through. This is that missing coverage: two real
+/// `Engine`s, real WebSocket connections, the production call site.
+///
+/// Plain `#[test]`, not `#[tokio::test]` — `Engine::start` blocks on its own
+/// internal runtime to boot the mesh (see engine.rs), which panics if called
+/// from a thread already driving a Tokio runtime. Same shape as phase1b.rs's
+/// `rooms_broadcast_end_to_end`: build both engines synchronously first,
+/// then a fresh outer runtime drives the WebSocket clients.
+#[test]
+fn engine_broadcast_room_remote_except_at_the_real_facade() {
+    let cfg1 = Config {
+        cluster: Some(ClusterConfig {
+            node_id: 1,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            seeds: vec![],
+            secret: SECRET.to_vec(),
+            cluster_name: "prod".into(),
+        }),
+        ..Default::default()
+    };
+    let (engine1, _rx1) = Engine::start(cfg1, 256, false).unwrap();
+    let engine1 = Arc::new(engine1);
+    engine1.listen(0).unwrap(); // must accept even though this test drives no client on node1
+    let mesh_addr1 = engine1.cluster().unwrap().mesh().addr();
+
+    let cfg2 = Config {
+        cluster: Some(ClusterConfig {
+            node_id: 2,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            seeds: vec![mesh_addr1],
+            secret: SECRET.to_vec(),
+            cluster_name: "prod".into(),
+        }),
+        ..Default::default()
+    };
+    let (engine2, mut rx2) = Engine::start(cfg2, 256, false).unwrap();
+    let engine2 = Arc::new(engine2);
+    let ws_port2 = engine2.listen(0).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        assert!(
+            poll_until(
+                || {
+                    engine1.cluster().unwrap().mesh().peer_count() == 1
+                        && engine2.cluster().unwrap().mesh().peer_count() == 1
+                },
+                Duration::from_secs(4)
+            )
+            .await,
+            "2-node mesh did not converge"
+        );
+
+        // Two real connections on node 2, both joined to "lobby" — one will
+        // be named in node 1's remote_except, the other must still receive.
+        let url2 = format!("ws://127.0.0.1:{ws_port2}/");
+        let (mut excepted, _) = tokio_tungstenite::connect_async(&url2).await.unwrap();
+        let excepted_id = wait_for_open(&mut rx2, Duration::from_secs(2)).await;
+        let (mut member, _) = tokio_tungstenite::connect_async(&url2).await.unwrap();
+        let member_id = wait_for_open(&mut rx2, Duration::from_secs(2)).await;
+        engine2.join(excepted_id, "lobby");
+        engine2.join(member_id, "lobby");
+
+        assert!(
+            poll_until(
+                || engine1.cluster().unwrap().interested_room_peers("lobby") == vec![2],
+                Duration::from_secs(3)
+            )
+            .await,
+            "interest for lobby did not propagate to node1"
+        );
+
+        // The real facade call, no test-harness shortcut: remote_except
+        // names node 2's `excepted` connection by its genuine NodeConnId.
+        engine1.broadcast_room(
+            "lobby",
+            Bytes::from("hello except"),
+            false,
+            &[],
+            &[NodeConnId {
+                node: 2,
+                local: excepted_id,
+            }],
+        );
+
+        // The non-excepted member on the same remote node still gets it.
+        assert_eq!(
+            member.next().await.unwrap().unwrap(),
+            Message::Text("hello except".into())
+        );
+        // The excepted connection must get NOTHING — give the relay a grace
+        // window, then confirm no frame arrived.
+        let raced = tokio::time::timeout(Duration::from_millis(500), excepted.next()).await;
+        assert!(
+            raced.is_err(),
+            "remote_except must be honored at the real Engine::broadcast_room facade, \
+             not just the hand-rolled test replica"
+        );
+
+        excepted.close(None).await.ok();
+        member.close(None).await.ok();
+    });
+
+    Arc::try_unwrap(engine1)
+        .ok()
+        .expect("sole owner")
+        .shutdown();
+    Arc::try_unwrap(engine2)
+        .ok()
+        .expect("sole owner")
+        .shutdown();
 }
 
 #[test]
