@@ -22,7 +22,7 @@
     "build": "tsc -p tsconfig.json",
     "build:native": "cargo build -p beamsocket-node --release --features napi && node scripts/copy-native.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"__tests__/**/*.test.mjs\""
+    "test": "node scripts/run-tests.mjs"
   },
   "optionalDependencies": {
     "beamsocket-linux-x64-gnu": "0.2.0",
