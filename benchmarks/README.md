@@ -24,6 +24,14 @@ happens on the pinned box (see "Pinned-box steps" below).
 | Node | v20.19.5 (official build — the distro Node 18 has a nonstandard ABI 109 that uWS ships no binary for) |
 | Rust | 1.96.1, `--release` |
 
+**Node version is load-bearing for this suite, not just this run's choice.**
+`uWebSockets.js` only ships prebuilt binaries for Node 18/20/21/22 — pick one
+of those for *every* library in a comparison run (`driver.mjs`'s own
+`main()` boots each library under whatever `node` invoked it), so no library
+gets an ABI-generation advantage over another. A 2026-08-20 same-box rerun
+used v22.23.2 for this reason (this box's default was v24, which uWS's
+prebuilds don't cover); see `docs/reports/0.3.0-task1-flush.md`.
+
 ## Suites
 
 - **Fan-out** (`fanout.mjs`): N clients subscribed to one room/topic; one
