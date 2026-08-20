@@ -21,7 +21,7 @@ cp -r "$PKG/dist" "$PKG/native" "$STAGE/"
 cat > "$STAGE/package.json" <<'JSON'
 {
   "name": "beamsocket",
-  "version": "0.1.0-alpha.0",
+  "version": "0.2.0",
   "description": "The high-performance networking runtime for Node.js — Rust engine, JS API. Preview build: linux-x64 (glibc) only.",
   "license": "MIT",
   "type": "module",
@@ -39,5 +39,5 @@ JSON
 mv "$STAGE"/beamsocket-*.tgz .
 echo
 echo "Packed: $(ls beamsocket-*.tgz)"
-echo "Publish with:  npm publish beamsocket-0.1.0-alpha.0.tgz --tag alpha --access public"
+echo "Publish with:  npm publish beamsocket-0.2.0.tgz --tag alpha --access public"
 echo "(you must be 'npm login'-ed, or have NPM_TOKEN set in your env)"

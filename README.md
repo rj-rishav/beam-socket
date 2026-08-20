@@ -4,6 +4,30 @@
 
 Rust data plane, JavaScript control plane. Maximum connections, minimum overhead.
 
+```bash
+npm install beamsocket@alpha
+```
+
+> **Live on npm** (`0.1.0-alpha.0`, `alpha` tag). Prebuilt binaries for
+> **linux-x64, macOS arm64, Windows x64** — no toolchain needed. Verified
+> end-to-end from the published package: install → boot a server → echo a
+> client. It's an alpha — single-node today, three platforms, headline perf
+> numbers still pending a pinned-box run (see [benchmarks](benchmarks/REPORT.md),
+> which publishes the losses too). Install pulls under the `alpha` tag; plain
+> `npm install beamsocket` waits for a `latest` release.
+
+```ts
+import { BeamSocket } from 'beamsocket';
+
+const io = new BeamSocket({});
+io.on('connection', (socket) => {
+  socket.join('lobby');
+  socket.on('message', (data) => socket.send(data)); // echo
+});
+io.toRoom('lobby').send('hello everyone');            // fan-out runs in Rust
+await io.listen(8080);
+```
+
 **Status:** `0.1.0-alpha.0` — **Phase 1 + 1.1 merged to master** (echo, rooms,
 broadcast, identity, admission limits, presence, metrics, graceful close, HTTP
 attach), all gates closed in sequence; 60 Rust + 26 JS tests green on the merged
@@ -21,14 +45,26 @@ and single-node mode proven zero-cost (no mesh spawned, ~405 ns/verb, the 112
 pre-mesh tests unchanged). Rust core: 166 tests. See
 [ENGINEERING.md §13](docs/ENGINEERING.md).
 
-**Release blockers before the alpha goes public** (need real hardware /
-credentials, not closable in a sandbox): pinned-box bridge-constant
-re-confirmation (`--gate-seconds 600`), pinned-box benchmark suite (100k fan-out
-gate, Socket.IO ≥25k, echo p99), the full 10-minute soak, npm publish +
-per-platform install test, and the darwin CI run that proves the macOS attach
-row. **Before any release claims cluster support:** RFC 0004's 30-minute
-real-hardware mesh soak, and swapping the mesh's vendored HMAC/SHA-256 for the
-audited `hmac`/`sha2` crates (auth-path crypto ships audited, not hand-rolled). **Parked backlog** (deliberately after Phase 2): RFC 0003 engine-side TLS
+**Staged for `0.2.0` (branch `v0.2.0-cluster-js`, 2026-08-20):** clustering
+reaches JavaScript — a mesh forms from `new BeamSocket({ cluster: {...} })`
+alone, every targeting verb relays cross-node exactly once, `except()` and
+`toSocket()` are node-aware, and `io.stats().cluster` exposes membership and
+relay counters. The mesh's auth-path crypto now ships as the audited
+`hmac`/`sha2` crates (KAT-regression proven byte-identical to the vendored
+impl it replaces). Plus a measured hot-path win: an adaptive bridge flush cut
+echo p50 from 2.19 ms to 1.03 ms (−53%) and nearly closed the
+low-concurrency latency gap to raw `ws`/uWS
+([report](docs/reports/0.3.0-task1-flush.md)). Full verification matrix
+green (fmt, clippy ×3, `cargo test --workspace`, tsc, 50/50 JS tests,
+by-hand 3-node cluster run).
+
+**Still-open release blockers** (need real hardware, not closable in a
+sandbox — tracked in [docs/plans/0.3.0-performance.md](docs/plans/0.3.0-performance.md)):
+pinned-box bridge-constant re-confirmation (`--gate-seconds 600`), pinned-box
+benchmark suite (100k fan-out gate, Socket.IO ≥25k, echo p99), the full
+10-minute soak, and — before cluster support graduates from alpha feature to
+headline claim — RFC 0004's 30-minute real-hardware mesh soak. **Parked
+backlog** (deliberately after Phase 2): RFC 0003 engine-side TLS
 (`listen(443, { cert })`, rustls) and the Windows fd-handoff spike
 (`WSADuplicateSocket`).
 

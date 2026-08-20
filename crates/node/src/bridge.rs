@@ -35,6 +35,15 @@ pub const BRIDGE_BATCH: usize = 256;
 /// the added latency at low load without fragmenting batches at high load.
 pub const BRIDGE_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Below this many events, finding the queue already empty right after the
+/// first one means "quiet — ship it now" rather than "wait `BRIDGE_FLUSH_INTERVAL`
+/// for company that isn't coming" (0.3.0 performance phase, Task 1: this
+/// timer wait was most of the low-concurrency p50 gap vs raw-transport
+/// libraries). Under real load the greedy drain in `drain_loop` already pulls
+/// the batch past this bound before it's ever checked, so this path is
+/// inert there — see `drain_loop_low_load_flushes_immediately_without_the_timer`.
+const LOW_LOAD_THRESHOLD: usize = 16;
+
 /// Capacity of the bounded engine↔bridge queue (Rule 5). Overflow is
 /// drop-newest and counted in `bridge_pressure` — never silent. The value is a
 /// starting point graduated from the spike's harness (`queue_capacity = 8192`,
@@ -313,6 +322,31 @@ pub async fn drain_loop<F: FnMut(Vec<u8>)>(
             Some(ev) => batch.push(ev),
             None => break,
         }
+
+        // Greedily take whatever is ALREADY queued — no waiting involved.
+        // Under load this is most of a batch already; under idle load it's
+        // nothing more (the producer hasn't had time to add another event).
+        while batch.len() < BRIDGE_BATCH {
+            match rx.try_recv() {
+                Ok(ev) => batch.push(ev),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    flush(&mut batch, &mut deliver);
+                    break 'outer;
+                }
+            }
+        }
+
+        // Channel is empty right now and the batch is still small: low-load
+        // regime (e.g. one echo in flight) — ship it now rather than pay the
+        // full BRIDGE_FLUSH_INTERVAL for a batch-mate that isn't coming.
+        // Under sustained load the greedy drain above already pushed the
+        // batch past LOW_LOAD_THRESHOLD, so this branch is never taken there.
+        if batch.len() < LOW_LOAD_THRESHOLD {
+            flush(&mut batch, &mut deliver);
+            continue;
+        }
+
         // Fill until batch size or the flush timer fires (measured from the
         // first event — the oldest event's wait bounds the added latency).
         let deadline = tokio::time::sleep(BRIDGE_FLUSH_INTERVAL);
@@ -507,5 +541,51 @@ mod tests {
         let mut flushes: Vec<usize> = Vec::new();
         drain_loop(rx, |buf| flushes.push(decode(&buf).len())).await;
         assert_eq!(flushes, vec![BRIDGE_BATCH, 3]);
+    }
+
+    /// 0.3.0 performance phase, Task 1: below `LOW_LOAD_THRESHOLD`, a batch
+    /// must flush as soon as the queue runs dry — NOT wait out
+    /// `BRIDGE_FLUSH_INTERVAL` for a batch-mate that isn't coming. This is
+    /// distinct from `drain_loop_batches_by_size_and_flushes_rest_on_close`:
+    /// that test flushes its tail via channel *closure* (`Disconnected`);
+    /// this one keeps the sender alive, so the only thing that can be
+    /// triggering the flush is the immediate-flush-when-quiet path itself.
+    #[tokio::test]
+    async fn drain_loop_low_load_flushes_immediately_without_the_timer() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        for i in 0..3u64 {
+            tx.send(EngineEvent::Message {
+                id: ConnectionId(i),
+                payload: bytes::Bytes::from_static(b"x"),
+                is_binary: false,
+            })
+            .await
+            .unwrap();
+        }
+
+        let (flush_tx, mut flush_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(usize, std::time::Duration)>();
+        let start = std::time::Instant::now();
+        tokio::spawn(drain_loop(rx, move |buf| {
+            let _ = flush_tx.send((decode(&buf).len(), start.elapsed()));
+        }));
+
+        let (count, elapsed) = tokio::time::timeout(Duration::from_millis(500), flush_rx.recv())
+            .await
+            .expect("drain_loop never flushed")
+            .expect("flush channel closed unexpectedly");
+
+        assert_eq!(
+            count, 3,
+            "the 3 already-queued events must arrive in one flush"
+        );
+        assert!(
+            elapsed < BRIDGE_FLUSH_INTERVAL,
+            "low-load flush took {elapsed:?}, expected well under the \
+             {BRIDGE_FLUSH_INTERVAL:?} timer — the immediate-flush-when-quiet \
+             path did not fire"
+        );
+
+        drop(tx); // let the still-running spawned drain_loop task exit cleanly
     }
 }

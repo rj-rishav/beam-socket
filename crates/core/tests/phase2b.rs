@@ -172,7 +172,7 @@ fn disconnect_user_closes_all_devices_and_destroys_the_identity_entry() {
         await_true("registry empty", || engine.connection_count() == 0).await;
 
         // …so toUser reaches 0.
-        let report = engine.broadcast_user("alice", Bytes::from_static(b"gone?"), false, &[]);
+        let report = engine.broadcast_user("alice", Bytes::from_static(b"gone?"), false, &[], &[]);
         assert_eq!(report.attempted, 0, "toUser must reach 0 after the sweep");
 
         // Counted: one per device closed.
@@ -252,13 +252,13 @@ fn close_room_removes_members_destroys_room_keeps_connections_alive() {
         assert_eq!(engine.room_count(), 1, "only 'other' survives");
         // …bidirectional views agree: no connection still claims 'lobby'
         // (broadcast to it reaches nobody), while 'other' is untouched.
-        let report = engine.broadcast_room("lobby", Bytes::from_static(b"x"), false, &[]);
+        let report = engine.broadcast_room("lobby", Bytes::from_static(b"x"), false, &[], &[]);
         assert_eq!(report.attempted, 0);
         assert_eq!(engine.room_member_count("other"), 1);
 
         // Connections STAY ALIVE (disconnect-free): all three still reachable.
         assert_eq!(engine.connection_count(), 3);
-        let report = engine.broadcast_all(Bytes::from_static(b"alive"), false, &[]);
+        let report = engine.broadcast_all(Bytes::from_static(b"alive"), false, &[], &[]);
         assert_eq!(report.queued, 3);
         for ws in [&mut a, &mut b, &mut c] {
             let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())

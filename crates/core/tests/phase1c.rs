@@ -197,7 +197,7 @@ fn multi_device_to_user_reaches_every_device() {
         assert_eq!(engine.user_count(), 1);
 
         // toUser reaches all three devices, one allocation, one FFI call.
-        let report = engine.broadcast_user("alice", Bytes::from_static(b"ping"), false, &[]);
+        let report = engine.broadcast_user("alice", Bytes::from_static(b"ping"), false, &[], &[]);
         assert_eq!(report.queued, 3);
         for ws in [&mut a, &mut b, &mut c] {
             assert_eq!(
@@ -212,7 +212,7 @@ fn multi_device_to_user_reaches_every_device() {
             engine.user_device_count("alice") == 2
         })
         .await;
-        let report = engine.broadcast_user("alice", Bytes::from_static(b"again"), false, &[]);
+        let report = engine.broadcast_user("alice", Bytes::from_static(b"again"), false, &[], &[]);
         assert_eq!(report.queued, 2);
         assert_eq!(
             b.next().await.unwrap().unwrap(),
@@ -231,7 +231,7 @@ fn multi_device_to_user_reaches_every_device() {
         // toUser to a vanished user is a benign no-op.
         assert_eq!(
             engine
-                .broadcast_user("alice", Bytes::from_static(b"x"), false, &[])
+                .broadcast_user("alice", Bytes::from_static(b"x"), false, &[], &[])
                 .attempted,
             0
         );

@@ -11,7 +11,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use beamsocket_core::broadcast::FanoutReport;
-use beamsocket_core::config::{BackpressurePolicy, Config, TrustProxy};
+use beamsocket_core::cluster::NodeConnId;
+use beamsocket_core::config::{BackpressurePolicy, ClusterConfig, Config, TrustProxy};
 #[cfg(unix)]
 use beamsocket_core::engine::{AttachOutcome, ParsedUpgrade};
 use beamsocket_core::engine::{Engine, SendStatus};
@@ -62,6 +63,57 @@ pub struct JsConfig {
     // ── Phase 2A ──
     /// Rate-sampler interval (ms). Default 1000; 0 disables the sampler.
     pub sampler_ms: Option<f64>,
+    // ── 0.2.0: cluster mesh (RFC 0004) ──
+    /// `None` (default) is single-node: `Engine::start` spawns no mesh, no
+    /// task, no cost (Phase 3D's zero-cost contract — this is the addon-side
+    /// half of it; the core half has been true since Phase 3D).
+    pub cluster: Option<JsClusterConfig>,
+}
+
+/// Native shape of the SDK's `ClusterConfig` (types.ts) — 0.2.0.
+#[napi(object)]
+pub struct JsClusterConfig {
+    /// Operator-assigned node id, unique in the mesh (§4.5). u16 range,
+    /// crosses as f64 like every other napi number field here.
+    pub node_id: f64,
+    /// Mesh bind address, `host:port` (TCP link + UDP swim share the port).
+    pub listen: String,
+    /// Seed member addresses to bootstrap from (any live member works).
+    pub seeds: Vec<String>,
+    /// Shared cluster secret (UTF-8 on the wire from JS; turned into raw
+    /// HMAC key bytes here — the mesh only ever sees `Vec<u8>`).
+    pub secret: String,
+    /// Cluster name — the accidental-cross-cluster barrier (§4.4). Defaults
+    /// to `"default"` when omitted (matches `ClusterConfig.clusterName`'s
+    /// documented default in types.ts).
+    pub cluster_name: Option<String>,
+}
+
+fn to_cluster_config(js: JsClusterConfig) -> Result<ClusterConfig> {
+    if js.node_id < 0.0 || js.node_id > u16::MAX as f64 || js.node_id.fract() != 0.0 {
+        return Err(Error::from_reason(format!(
+            "cluster.nodeId must be an integer in 0..65535, got {}",
+            js.node_id
+        )));
+    }
+    let listen = js
+        .listen
+        .parse()
+        .map_err(|e| Error::from_reason(format!("cluster.listen {:?}: {e}", js.listen)))?;
+    let mut seeds = Vec::with_capacity(js.seeds.len());
+    for s in &js.seeds {
+        seeds.push(
+            s.parse()
+                .map_err(|e| Error::from_reason(format!("cluster.seeds entry {s:?}: {e}")))?,
+        );
+    }
+    Ok(ClusterConfig {
+        node_id: js.node_id as u16,
+        listen,
+        seeds,
+        secret: js.secret.into_bytes(),
+        cluster_name: js.cluster_name.unwrap_or_else(|| "default".to_string()),
+    })
 }
 
 fn to_config(js: JsConfig) -> Result<Config> {
@@ -115,6 +167,9 @@ fn to_config(js: JsConfig) -> Result<Config> {
     if let Some(v) = js.sampler_ms {
         c.observability.sampler_ms = v.max(0.0) as u64;
     }
+    if let Some(cluster) = js.cluster {
+        c.cluster = Some(to_cluster_config(cluster)?);
+    }
     // Surface config errors (e.g. a malformed trustProxy CIDR) at construction.
     c.validate()
         .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -148,6 +203,31 @@ pub struct JsStats {
     pub uptime_ms: f64,
     /// EWMA rates; `None` when the sampler is disabled (`samplerMs: 0`).
     pub rates: Option<JsRates>,
+    // ── 0.2.0: cluster mesh ──
+    /// `None` when single-node — mirrors the `rates` Option<T> pattern.
+    pub cluster: Option<JsClusterStats>,
+}
+
+/// One `stats().cluster.peerPressures[]` row (0.2.0). napi objects don't
+/// cross as tuples, so `(nodeId, pressure)` becomes this on the wire; the SDK
+/// (native.ts/server.ts) turns it back into `[nodeId, pressure]`.
+#[napi(object)]
+pub struct JsPeerPressure {
+    pub node_id: f64,
+    pub pressure: f64,
+}
+
+/// `stats().cluster` (0.2.0) — `engine.cluster_summary()` +
+/// `engine.cluster_peer_pressures()`, both already implemented on the core
+/// side since Phase 3D and just now read from the addon.
+#[napi(object)]
+pub struct JsClusterStats {
+    pub node_id: f64,
+    pub peers: f64,
+    pub relay_in: f64,
+    pub relay_out: f64,
+    pub relay_drops: f64,
+    pub peer_pressures: Vec<JsPeerPressure>,
 }
 
 /// EWMA rate snapshot (Phase 2A): each rate over a ~1 s and a ~10 s window.
@@ -361,6 +441,11 @@ impl BeamEngine {
     /// Room broadcast. `except`: flat [hi0, lo0, hi1, lo1, …] id pairs.
     /// One payload copy at this boundary (Buffer→Bytes, the single
     /// unavoidable outbound copy), then refcount clones per recipient.
+    /// `remoteExcept` (0.2.0): flat [node, hi, lo, …] triples — excepted
+    /// connections that live on ANOTHER node. Empty in every single-node
+    /// call (the SDK passes a shared empty `Uint32Array`), so parsing it
+    /// costs one zero-iteration loop — no allocation, no branch cost beyond
+    /// what `except` already paid.
     #[napi]
     pub fn broadcast_room(
         &self,
@@ -368,6 +453,7 @@ impl BeamEngine {
         data: Buffer,
         is_binary: bool,
         except: Uint32Array,
+        remote_except: Uint32Array,
     ) -> Result<JsFanout> {
         let engine = self.engine()?;
         let report = engine.broadcast_room(
@@ -375,6 +461,7 @@ impl BeamEngine {
             bytes::Bytes::from(data.to_vec()),
             is_binary,
             &except_ids(&except),
+            &except_ids_remote(&remote_except),
         );
         Ok(report.into())
     }
@@ -386,6 +473,7 @@ impl BeamEngine {
         room: String,
         data: String,
         except: Uint32Array,
+        remote_except: Uint32Array,
     ) -> Result<JsFanout> {
         let engine = self.engine()?;
         let report = engine.broadcast_room(
@@ -393,6 +481,7 @@ impl BeamEngine {
             bytes::Bytes::from(data.into_bytes()),
             false,
             &except_ids(&except),
+            &except_ids_remote(&remote_except),
         );
         Ok(report.into())
     }
@@ -404,26 +493,60 @@ impl BeamEngine {
         data: Buffer,
         is_binary: bool,
         except: Uint32Array,
+        remote_except: Uint32Array,
     ) -> Result<JsFanout> {
         let engine = self.engine()?;
         let report = engine.broadcast_all(
             bytes::Bytes::from(data.to_vec()),
             is_binary,
             &except_ids(&except),
+            &except_ids_remote(&remote_except),
         );
         Ok(report.into())
     }
 
     /// Text fast path for global broadcast.
     #[napi]
-    pub fn broadcast_text_all(&self, data: String, except: Uint32Array) -> Result<JsFanout> {
+    pub fn broadcast_text_all(
+        &self,
+        data: String,
+        except: Uint32Array,
+        remote_except: Uint32Array,
+    ) -> Result<JsFanout> {
         let engine = self.engine()?;
         let report = engine.broadcast_all(
             bytes::Bytes::from(data.into_bytes()),
             false,
             &except_ids(&except),
+            &except_ids_remote(&remote_except),
         );
         Ok(report.into())
+    }
+
+    /// `toSocket(id)` for a node-prefixed id naming ANOTHER cluster member
+    /// (0.2.0, §4.5). Local/same-node targets never reach this — the SDK's
+    /// `Target.send()` calls the plain `send`/`sendText` for those, unchanged.
+    /// No text fast path: cross-node is already a relay hop, not the hot path
+    /// this crate optimizes (bridge constants untouched, Rule 1 unaffected).
+    #[napi]
+    pub fn send_node(
+        &self,
+        node: u32,
+        id_hi: u32,
+        id_lo: u32,
+        data: Buffer,
+        is_binary: bool,
+    ) -> Result<u32> {
+        let engine = self.engine()?;
+        let target = NodeConnId {
+            node: node as u16,
+            local: conn_id(id_hi, id_lo),
+        };
+        Ok(status_code(engine.send_node(
+            target,
+            bytes::Bytes::from(data.to_vec()),
+            is_binary,
+        )))
     }
 
     #[napi]
@@ -469,6 +592,7 @@ impl BeamEngine {
         data: Buffer,
         is_binary: bool,
         except: Uint32Array,
+        remote_except: Uint32Array,
     ) -> Result<JsFanout> {
         let engine = self.engine()?;
         Ok(engine
@@ -477,6 +601,7 @@ impl BeamEngine {
                 bytes::Bytes::from(data.to_vec()),
                 is_binary,
                 &except_ids(&except),
+                &except_ids_remote(&remote_except),
             )
             .into())
     }
@@ -488,6 +613,7 @@ impl BeamEngine {
         user_id: String,
         data: String,
         except: Uint32Array,
+        remote_except: Uint32Array,
     ) -> Result<JsFanout> {
         let engine = self.engine()?;
         Ok(engine
@@ -496,6 +622,7 @@ impl BeamEngine {
                 bytes::Bytes::from(data.into_bytes()),
                 false,
                 &except_ids(&except),
+                &except_ids_remote(&remote_except),
             )
             .into())
     }
@@ -554,6 +681,23 @@ impl BeamEngine {
                 bytes_out_1s: Rates::load(&r.bytes_out_1s),
                 bytes_out_10s: Rates::load(&r.bytes_out_10s),
             }),
+            cluster: engine.cluster_summary().map(
+                |(node_id, peers, relay_in, relay_out, relay_drops)| JsClusterStats {
+                    node_id: node_id as f64,
+                    peers: peers as f64,
+                    relay_in: relay_in as f64,
+                    relay_out: relay_out as f64,
+                    relay_drops: relay_drops as f64,
+                    peer_pressures: engine
+                        .cluster_peer_pressures()
+                        .into_iter()
+                        .map(|(id, pressure)| JsPeerPressure {
+                            node_id: id as f64,
+                            pressure,
+                        })
+                        .collect(),
+                },
+            ),
         })
     }
 
@@ -826,6 +970,19 @@ fn membership_code(c: MembershipChange) -> u32 {
 /// caller bug and is ignored).
 fn except_ids(pairs: &Uint32Array) -> Vec<ConnectionId> {
     pairs.chunks_exact(2).map(|p| conn_id(p[0], p[1])).collect()
+}
+
+/// Decode the flat [node, hi, lo, node, hi, lo, …] remote-except list (0.2.0)
+/// — a trailing partial triple is a caller bug and is ignored, same policy as
+/// `except_ids`. Empty in every single-node call.
+fn except_ids_remote(triples: &Uint32Array) -> Vec<NodeConnId> {
+    triples
+        .chunks_exact(3)
+        .map(|t| NodeConnId {
+            node: t[0] as u16,
+            local: conn_id(t[1], t[2]),
+        })
+        .collect()
 }
 
 /// Fan-out accounting (mirrors beamsocket_core::broadcast::FanoutReport).
