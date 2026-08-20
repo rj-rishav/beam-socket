@@ -28,7 +28,9 @@ const OUT = args.out;
 const isSio = LIB === 'socketio';
 
 // ---- config (sandbox-feasible scale; the pinned box scales these up) ----
-const MEM_CONNS = Number(args.memConns ?? 3000);
+const MEM_CONNS = Number(args.memConns ?? 10000);
+const MEM_SETTLE_MS = Number(args.memSettleMs ?? 8000);
+const MEM_SAMPLES = Number(args.memSamples ?? 8);
 const FANOUT_SIZES = (args.fanout ?? '1000,3000,5000').split(',').map(Number);
 const FANOUT_REPS = 5;
 const LAT_CONNS = 50;
@@ -145,15 +147,64 @@ function pct(sorted, p) {
 }
 
 // ---- metrics ----
+function median(nums) {
+  const s = [...nums].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+async function sampleRss(pid, n, spacingMs) {
+  const samples = [];
+  for (let i = 0; i < n; i++) {
+    samples.push(rssKB(pid));
+    if (i < n - 1) await sleep(spacingMs);
+  }
+  return { median: median(samples), samples };
+}
+
+// RSS on this box moves in discrete GC/allocator-trim steps, not smoothly —
+// a fresh batch of connections can sit at a transiently high reading for a
+// few seconds before one such step lands. A median over the WHOLE sampling
+// window is still hostage to how many samples landed before vs after that
+// step. A trailing window (the last half of the samples) is deliberately
+// biased toward the post-step steady state instead of a coin flip between
+// pre- and post-step readings.
+function trailingMedian(samples) {
+  const tail = samples.slice(Math.ceil(samples.length / 2));
+  return median(tail);
+}
+
 async function measureMemory(port, pid) {
-  const base = rssKB(pid);
+  // Opening MEM_CONNS connections is itself enough allocation pressure to
+  // trigger a GC/allocator-trim pass — one that a "base" snapshot taken
+  // beforehand never gets the benefit of. Measured directly: base and
+  // loaded taken back-to-back put loaded's RSS *below* base's, which is
+  // physically backwards for a process that only gained live connections.
+  // Fix: put base through the same churn-then-settle treatment as loaded,
+  // via a throwaway warm-up batch, so both readings reflect the same
+  // "after a connection burst, allocator settled" state and only differ by
+  // the connections that are actually still open.
+  const warmup = await openMany(port, Math.min(MEM_CONNS, 2000));
+  await sleep(2000);
+  warmup.forEach((c) => c.close());
+  await sleep(2000);
+  const baseR = await sampleRss(pid, 3, 1000);
+  const base = baseR.median;
+
   const clients = await openMany(port, MEM_CONNS);
-  await sleep(2000); // settle
-  const withConns = rssKB(pid);
+  await sleep(MEM_SETTLE_MS); // settle — allocator/kernel noise needs real time at this N
+  const loadedR = await sampleRss(pid, MEM_SAMPLES, 1500);
+  const withConns = trailingMedian(loadedR.samples);
   const perConn = (withConns - base) / MEM_CONNS;
   clients.forEach((c) => c.close());
   await sleep(500);
-  return { conns: MEM_CONNS, baseRssKB: base, loadedRssKB: withConns, bytesPerConn: Math.round(perConn * 1024) };
+  return {
+    conns: MEM_CONNS,
+    baseRssKB: base,
+    baseSamplesKB: baseR.samples,
+    loadedRssKB: withConns,
+    rssSamplesKB: loadedR.samples,
+    bytesPerConn: Math.round(perConn * 1024),
+  };
 }
 
 async function measureLatency(port) {

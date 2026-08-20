@@ -110,6 +110,16 @@ until those levers are pulled. The `identity`/presence additions cost ~0 here
 that already exists). Numbers reproduce via `--ignored` measurement tests in
 `crates/core/tests/phase1d.rs` and the density benchmark below.
 
+**`driver.mjs`'s idle-memory suite needs ≥10,000 connections and an 8 s
+settle to produce a `bytesPerConn` figure that's stable run-to-run on a
+shared box** (below that, RSS-delta measurement is dominated by allocator/GC
+step noise rather than actual connection cost — a 3,000-conn/2 s-settle run
+was found to swing 5–10× between identical back-to-back runs). It also
+churns a throwaway connection batch before sampling "base," so both the
+base and loaded readings get the same allocator-settling treatment — without
+that, base and loaded aren't measuring the same thing and the delta is
+meaningless.
+
 ## Running
 
 ```bash
