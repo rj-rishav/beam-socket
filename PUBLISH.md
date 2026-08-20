@@ -32,10 +32,23 @@ publishes on a version tag. You do three things, once:
 2. **Add your npm token as a GitHub secret** named `NPM_TOKEN`
    (repo → Settings → Secrets and variables → Actions → New repository secret).
    *Never paste the token into code, chat, or a commit.*
-3. **Tag and push:**
+3. **Tag and push** (from `main`, after the release branch merges):
    ```bash
-   git tag v0.1.0-alpha.0
-   git push origin v0.1.0-alpha.0
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+4. **After the publish succeeds:** regenerate the lockfile against the now-
+   published platform packages and commit it —
+   ```bash
+   npm install          # resolves beamsocket-*-0.2.0 with real integrity hashes
+   ```
+   (the lockfile deliberately still points at the 0.1.0-alpha.0 platform
+   tarballs until then — hand-editing versions without real registry hashes
+   would produce a lockfile that lies about what it can verify), then run the
+   install-and-echo smoke test from a clean directory:
+   ```bash
+   mkdir /tmp/smoke && cd /tmp/smoke && npm init -y && npm install beamsocket@alpha
+   node -e "import('beamsocket').then(async ({BeamSocket}) => { const io = new BeamSocket({}); await io.listen(0); console.log('boots'); await io.close(); })"
    ```
 
 CI compiles the binary on each OS, publishes the six per-platform packages, then
@@ -60,7 +73,7 @@ npm run build:native -w beamsocket
 bash scripts/publish-preview.sh        # packs dist/ + native/ + preview manifest
 
 # publish (you must be `npm login`'d, or set NPM_TOKEN in your env):
-npm publish beamsocket-0.1.0-alpha.0.tgz --tag alpha --access public
+npm publish beamsocket-0.2.0.tgz --tag alpha --access public
 ```
 
 Notes:
@@ -76,11 +89,15 @@ Notes:
 
 ## Still owed before this is a "1.0-serious" release
 
-(unchanged from the README release-blocker list — a preview publish does not
-retire them)
+(a `0.2.0` alpha publish does not retire them)
 
 - pinned-box benchmark + constant re-confirmation, the 10-minute soak
-- the cluster mesh's 30-minute soak + the vendored-crypto → audited `hmac`/`sha2`
-  swap, before any release claims cluster support
-- JS-side cluster activation (the addon rebuild) — single-node works today;
-  clustering is Rust-proven but not yet reachable from JavaScript
+- the cluster mesh's 30-minute real-hardware soak, before any release
+  *upgrades* cluster support from "alpha feature" to a headline claim
+
+Retired on the `v0.2.0-cluster-js` branch (2026-08-20):
+- ~~vendored-crypto → audited `hmac`/`sha2` swap~~ — done, KAT-regression
+  green (FIPS 180-4 / RFC 4231 vectors byte-identical).
+- ~~JS-side cluster activation (the addon rebuild)~~ — done; clustering is
+  reachable from `new BeamSocket({ cluster: {...} })`, proven by the JS test
+  suite and a by-hand 3-node `examples/cluster` run.

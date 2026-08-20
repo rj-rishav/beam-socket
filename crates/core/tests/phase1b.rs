@@ -335,8 +335,13 @@ fn rooms_broadcast_end_to_end() {
         assert_eq!(engine.room_count(), 1);
 
         // Room broadcast with except: only c1 receives.
-        let report =
-            engine.broadcast_room("lobby", Bytes::from_static(b"hello room"), false, &[id2]);
+        let report = engine.broadcast_room(
+            "lobby",
+            Bytes::from_static(b"hello room"),
+            false,
+            &[id2],
+            &[],
+        );
         assert_eq!(report.queued, 1);
         assert_eq!(
             c1.next().await.unwrap().unwrap(),
@@ -344,7 +349,7 @@ fn rooms_broadcast_end_to_end() {
         );
 
         // broadcast_all reaches everyone, including the non-member.
-        let report = engine.broadcast_all(Bytes::from_static(b"to all"), false, &[]);
+        let report = engine.broadcast_all(Bytes::from_static(b"to all"), false, &[], &[]);
         assert_eq!(report.queued, 3);
         for c in [&mut c1, &mut c2, &mut c3] {
             assert_eq!(

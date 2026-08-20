@@ -15,7 +15,9 @@ export interface SocketEvents {
 }
 
 export class Socket extends EventEmitter {
-  /** Opaque. Do not parse — the encoding will change in Phase 3. */
+  /** Opaque. Do not parse — the encoding grew a node prefix in 0.2.0
+   * (three-segment) when clustered; single-node ids stay two-segment and
+   * byte-identical to pre-3D. */
   readonly id: string;
   readonly userId?: string;
   readonly metadata: Record<string, unknown>;
@@ -29,6 +31,8 @@ export class Socket extends EventEmitter {
    * @internal Constructed by the server's demux on ConnectionOpened. `userId`
    * and `metadata` come from the `authorize` hook that admitted this connection
    * (Phase 1C); both are absent for a connection admitted with no hook.
+   * `node` (0.2.0) is this server's own cluster node id — undefined in
+   * single-node mode, which keeps `id` two-segment.
    */
   constructor(
     native: NativeEngine,
@@ -36,12 +40,13 @@ export class Socket extends EventEmitter {
     idLo: number,
     userId?: string,
     metadata?: Record<string, unknown>,
+    node?: number,
   ) {
     super();
     this.#native = native;
     this._idHi = idHi;
     this._idLo = idLo;
-    this.id = encodeSocketId(idHi, idLo);
+    this.id = encodeSocketId(idHi, idLo, node);
     this.userId = userId;
     this.metadata = metadata ?? {};
   }

@@ -451,12 +451,23 @@ impl Engine {
 
     /// One FFI call per broadcast; the payload is ONE allocation, cloned by
     /// refcount into each member's bounded mailbox (ENGINEERING.md §6).
+    /// `remote_except` (0.2.0): excepted connections that live on ANOTHER
+    /// node — genuinely `NodeConnId`-tagged, unlike `except` (always local,
+    /// stamped with this node's id for the relay via `node_excepts`). Fixes
+    /// the gap where a cross-node except could never match on the receiving
+    /// peer (see the 0.2.0 CHANGELOG entry / PR notes "Fixed" section):
+    /// `except` alone has no way to name a foreign node, so a caller wanting
+    /// to exclude a remote socket MUST go through `remote_except`. Empty in
+    /// every single-node call — `.extend_from_slice(&[])` is a no-op, so this
+    /// is zero-cost when unclustered beyond the `self.cluster` match already
+    /// on this path.
     pub fn broadcast_room(
         &self,
         room: &str,
         data: bytes::Bytes,
         is_binary: bool,
         except: &[ConnectionId],
+        remote_except: &[NodeConnId],
     ) -> FanoutReport {
         // Single-node (the common case): the local fan-out is bit-identical to
         // pre-3D — `data` is moved in, no clone, no branch beyond this `match`.
@@ -480,18 +491,22 @@ impl Engine {
                     is_binary,
                     except,
                 );
-                c.relay_room(room, &data, is_binary, &node_excepts(c.node_id(), except));
+                let mut relay_except = node_excepts(c.node_id(), except);
+                relay_except.extend_from_slice(remote_except);
+                c.relay_room(room, &data, is_binary, &relay_except);
                 report
             }
         }
     }
 
-    /// Broadcast to every live connection.
+    /// Broadcast to every live connection. `remote_except` — see
+    /// `broadcast_room`'s doc comment.
     pub fn broadcast_all(
         &self,
         data: bytes::Bytes,
         is_binary: bool,
         except: &[ConnectionId],
+        remote_except: &[NodeConnId],
     ) -> FanoutReport {
         match &self.cluster {
             None => broadcast(
@@ -513,7 +528,9 @@ impl Engine {
                     is_binary,
                     except,
                 );
-                c.relay_all(&data, is_binary, &node_excepts(c.node_id(), except));
+                let mut relay_except = node_excepts(c.node_id(), except);
+                relay_except.extend_from_slice(remote_except);
+                c.relay_all(&data, is_binary, &relay_except);
                 report
             }
         }
@@ -524,12 +541,14 @@ impl Engine {
     /// Fan a payload out to every device of one user (`io.toUser().send()`),
     /// entirely in Rust over the sharded identity index — one FFI call, one
     /// allocation regardless of device count (reuses the 1B broadcast path).
+    /// `remote_except` — see `broadcast_room`'s doc comment.
     pub fn broadcast_user(
         &self,
         user_id: &str,
         data: bytes::Bytes,
         is_binary: bool,
         except: &[ConnectionId],
+        remote_except: &[NodeConnId],
     ) -> FanoutReport {
         match &self.cluster {
             None => broadcast(
@@ -551,12 +570,9 @@ impl Engine {
                     is_binary,
                     except,
                 );
-                c.relay_user(
-                    user_id,
-                    &data,
-                    is_binary,
-                    &node_excepts(c.node_id(), except),
-                );
+                let mut relay_except = node_excepts(c.node_id(), except);
+                relay_except.extend_from_slice(remote_except);
+                c.relay_user(user_id, &data, is_binary, &relay_except);
                 report
             }
         }
@@ -880,6 +896,50 @@ impl Engine {
                 Rates::load(&r.bytes_out_1s),
                 Rates::load(&r.bytes_out_10s),
             );
+        }
+
+        // 0.2.0: cluster mesh rows — absent entirely when single-node (no
+        // `# TYPE` lines emitted at all), matching the `stats().cluster`
+        // undefined-when-unclustered contract on the JS side.
+        if let Some((node_id, peers, relay_in, relay_out, relay_drops)) = self.cluster_summary() {
+            let _ = writeln!(
+                s,
+                "# HELP beamsocket_cluster_node_id This node's cluster id.\n# TYPE beamsocket_cluster_node_id gauge\nbeamsocket_cluster_node_id {node_id}"
+            );
+            gauge(
+                &mut s,
+                "beamsocket_cluster_peers",
+                "Live mesh peer links.",
+                peers as u64,
+            );
+            counter(
+                &mut s,
+                "beamsocket_cluster_relay_in_total",
+                "Relay frames received and fanned out locally.",
+                relay_in,
+            );
+            counter(
+                &mut s,
+                "beamsocket_cluster_relay_out_total",
+                "Relay frames sent to peers.",
+                relay_out,
+            );
+            counter(
+                &mut s,
+                "beamsocket_cluster_relay_drops_total",
+                "Relay frames dropped (full peer queue or unreachable peer).",
+                relay_drops,
+            );
+            let _ = writeln!(
+                s,
+                "# HELP beamsocket_cluster_peer_pressure Per-peer outbound mesh queue pressure (0..1).\n# TYPE beamsocket_cluster_peer_pressure gauge"
+            );
+            for (peer_id, pressure) in self.cluster_peer_pressures() {
+                let _ = writeln!(
+                    s,
+                    "beamsocket_cluster_peer_pressure{{peer=\"{peer_id}\"}} {pressure}"
+                );
+            }
         }
         s
     }

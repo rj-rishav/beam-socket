@@ -13,12 +13,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "
 # across the hop. Already in the workspace lockfile (core uses it).
 bytes = "1"
 
-# NOTE (deliberate non-dependency): HMAC-SHA256 is vendored in `crypto.rs`
-# rather than pulled from `hmac`/`sha2`. Rationale in the PR notes — it keeps
-# this crate std + tokio only (offline-buildable, zero Cargo.lock churn beyond
-# the new member), and RFC 4231 / FIPS 180-4 known-answer vectors prove it. A
-# swap to the RustCrypto crates is a one-line dependency change if review
-# prefers audited crypto over a vendored primitive.
+# 0.2.0: the crypto swap promised in the Phase 3A PR notes — audited
+# RustCrypto primitives instead of the vendored SHA-256/HMAC-SHA256 in
+# crypto.rs. `hmac`/`sha2` are the reference implementations the vendored
+# code was cross-checked against; every caller still takes `&[u8]` in,
+# `[u8; 32]` out (crypto.rs's doc comment), so nothing outside this file
+# changed. The FIPS 180-4 / RFC 4231 known-answer vector tests stay as a
+# regression suite against the new impl.
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Integration gates (§13.1) drive real loopback links, so the test crates need
