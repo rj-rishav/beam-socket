@@ -183,6 +183,19 @@ impl Config {
         // silently treat every peer as untrusted at runtime (a security
         // boundary must not degrade quietly — ARCHITECTURE §4).
         crate::limits::ClientIpResolver::from_trust_proxy(&self.trust_proxy)?;
+        // 0.2.0: defense-in-depth — the SDK (server.ts) already refuses an
+        // empty secret before any FFI call, but a caller that skips the SDK
+        // (a direct binding.rs consumer, a test) must not silently boot a
+        // mesh that authenticates peers with an empty HMAC key.
+        if let Some(c) = &self.cluster {
+            if c.secret.is_empty() {
+                return Err(ConfigError(
+                    "cluster.secret must not be empty — a mesh with no shared secret cannot \
+                     authenticate its peers (RFC 0004 §4.7)"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -248,5 +261,33 @@ mod tests {
         let mut c = Config::default();
         c.trust_proxy = TrustProxy::Cidrs(vec!["10.0.0.0/33".into()]); // impossible prefix
         assert!(c.validate().is_err());
+    }
+
+    // ── 0.2.0: cluster config validation ──
+
+    #[test]
+    fn cluster_with_empty_secret_rejected() {
+        let mut c = Config::default();
+        c.cluster = Some(ClusterConfig {
+            node_id: 1,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            seeds: vec![],
+            secret: Vec::new(),
+            cluster_name: "default".into(),
+        });
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn cluster_with_secret_accepted() {
+        let mut c = Config::default();
+        c.cluster = Some(ClusterConfig {
+            node_id: 1,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            seeds: vec![],
+            secret: b"a-real-secret".to_vec(),
+            cluster_name: "default".into(),
+        });
+        assert!(c.validate().is_ok());
     }
 }

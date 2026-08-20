@@ -48,6 +48,28 @@ export interface NativeStats {
   // Phase 2A
   uptimeMs: number;
   rates: NativeRates | null;
+  // 0.2.0 — cluster mesh; `null` when single-node (mirrors the `rates`
+  // Option<T> pattern already used here).
+  cluster: NativeClusterStats | null;
+}
+
+/** One `stats().cluster.peerPressures[]` row — `[nodeId, pressure]` on the TS
+ * side; napi objects don't cross as tuples, so this is the wire shape. */
+export interface NativePeerPressure {
+  nodeId: number;
+  pressure: number;
+}
+
+/** `stats().cluster` (0.2.0) — mirrors `engine.cluster_summary()` +
+ * `engine.cluster_peer_pressures()` (crates/core/src/engine.rs), already
+ * computed and waiting on the core side since Phase 3D. */
+export interface NativeClusterStats {
+  nodeId: number;
+  peers: number;
+  relayIn: number;
+  relayOut: number;
+  relayDrops: number;
+  peerPressures: NativePeerPressure[];
 }
 
 export interface NativeRoomStat {
@@ -97,6 +119,20 @@ export interface NativeConfig {
   maxPendingAuthorizations?: number;
   // Phase 2A
   samplerMs?: number;
+  // 0.2.0 — cluster mesh (RFC 0004, wired through from Phase 3D's core-only
+  // support). Absent = single-node: `to_config` in binding.rs leaves
+  // `Config.cluster` as `None`, so this field costs nothing when unused.
+  cluster?: NativeClusterConfig;
+}
+
+/** Native shape of `ClusterConfig` (types.ts) — `secret` crosses as a UTF-8
+ * string; Rust turns it into the HMAC key bytes. */
+export interface NativeClusterConfig {
+  nodeId: number;
+  listen: string;
+  seeds: string[];
+  secret: string;
+  clusterName?: string;
 }
 
 /** Send status codes from crates/node/src/binding.rs. */
@@ -140,11 +176,33 @@ export interface NativeEngine {
   // Phase 1B — each call is ONE FFI hop; fan-out runs in Rust.
   join(idHi: number, idLo: number, room: string): number;
   leave(idHi: number, idLo: number, room: string): number;
-  /** `except`: flat [hi, lo, hi, lo, …] id pairs. */
-  broadcastRoom(room: string, data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
-  broadcastTextRoom(room: string, data: string, except: Uint32Array): NativeFanout;
-  broadcastAll(data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
-  broadcastTextAll(data: string, except: Uint32Array): NativeFanout;
+  /**
+   * `except`: flat [hi, lo, hi, lo, …] LOCAL id pairs — unchanged since 1B,
+   * byte-identical wire shape in single-node builds (the zero-cost proof).
+   * `remoteExcept` (0.2.0): flat [node, hi, lo, node, hi, lo, …] triples for
+   * excepting a socket that lives on ANOTHER node — empty in single-node
+   * calls (the SDK passes a shared empty array, no per-call allocation).
+   */
+  broadcastRoom(
+    room: string,
+    data: Buffer,
+    isBinary: boolean,
+    except: Uint32Array,
+    remoteExcept: Uint32Array,
+  ): NativeFanout;
+  broadcastTextRoom(
+    room: string,
+    data: string,
+    except: Uint32Array,
+    remoteExcept: Uint32Array,
+  ): NativeFanout;
+  broadcastAll(
+    data: Buffer,
+    isBinary: boolean,
+    except: Uint32Array,
+    remoteExcept: Uint32Array,
+  ): NativeFanout;
+  broadcastTextAll(data: string, except: Uint32Array, remoteExcept: Uint32Array): NativeFanout;
   roomCount(): number;
   // Phase 1C — identity + authorize.
   /** JS's reply to an authorize request (reqHi/reqLo = request_id halves). */
@@ -156,8 +214,23 @@ export interface NativeEngine {
     hasUserId: boolean,
     code: number,
   ): void;
-  broadcastUser(userId: string, data: Buffer, isBinary: boolean, except: Uint32Array): NativeFanout;
-  broadcastTextUser(userId: string, data: string, except: Uint32Array): NativeFanout;
+  broadcastUser(
+    userId: string,
+    data: Buffer,
+    isBinary: boolean,
+    except: Uint32Array,
+    remoteExcept: Uint32Array,
+  ): NativeFanout;
+  broadcastTextUser(
+    userId: string,
+    data: string,
+    except: Uint32Array,
+    remoteExcept: Uint32Array,
+  ): NativeFanout;
+  // 0.2.0 — cluster mesh: `toSocket(id)` when `id` names another node (§4.5).
+  // Not on the hot path (cross-node is inherently a relay hop already), so
+  // there is no text fast path — the SDK encodes strings to a Buffer first.
+  sendNode(node: number, idHi: number, idLo: number, data: Buffer, isBinary: boolean): number;
   // Phase 1D — presence. One FFI call returns the room's (id, userId) pairs.
   presenceList(room: string): NativePresenceEntry[];
   // Phase 2A — observability read surface (one FFI call each).

@@ -1,0 +1,10 @@
+{
+  "name": "beamsocket-example-cluster",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "0.2.0 — a 3-node BeamSocket cluster mesh, formed and driven entirely from JS config.",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

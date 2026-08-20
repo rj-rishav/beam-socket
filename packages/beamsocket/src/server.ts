@@ -64,6 +64,28 @@ const LISTEN_MUTEX_MSG =
   'listen() is invalid when constructed with { server } — the HTTP server owns the port';
 
 /**
+ * Validate `cluster` config at construction (0.2.0) — fail loudly before any
+ * FFI call, same discipline as `Config::validate` on the Rust side
+ * (ENGINEERING.md §5). TypeScript already makes `secret`/`nodeId`/`listen`
+ * non-optional on `ClusterConfig`, but this guards plain-JS callers who
+ * bypass the type checker.
+ */
+function validateClusterConfig(cluster: NonNullable<BeamSocketConfig['cluster']>): void {
+  if (typeof cluster.secret !== 'string' || cluster.secret.length === 0) {
+    throw new Error(
+      'cluster.secret is required when cluster config is present — a mesh with no shared ' +
+        'secret cannot authenticate its peers (RFC 0004 §4.7). Use the same secret on every node.',
+    );
+  }
+  if (!Number.isInteger(cluster.nodeId) || cluster.nodeId < 0 || cluster.nodeId > 0xffff) {
+    throw new Error(`cluster.nodeId must be an integer in 0..65535, got ${cluster.nodeId}`);
+  }
+  if (typeof cluster.listen !== 'string' || cluster.listen.length === 0) {
+    throw new Error('cluster.listen is required when cluster config is present (e.g. "127.0.0.1:7946")');
+  }
+}
+
+/**
  * Validate an admin close code (Phase 2B): 1000 (default) or the 4000–4999
  * application range. Throws BEFORE any FFI call — the other registered codes
  * belong to the engine/RFC 6455 and would lie to the client (types.ts
@@ -114,6 +136,15 @@ function toNativeConfig(config: BeamSocketConfig): NativeConfig {
     authorizeTimeoutMs: config.authorize?.timeoutMs,
     maxPendingAuthorizations: config.authorize?.maxPending,
     samplerMs: config.observability?.samplerMs,
+    cluster: config.cluster
+      ? {
+          nodeId: config.cluster.nodeId,
+          listen: config.cluster.listen,
+          seeds: config.cluster.seeds ?? [],
+          secret: config.cluster.secret,
+          clusterName: config.cluster.clusterName,
+        }
+      : undefined,
   };
 }
 
@@ -141,10 +172,17 @@ export class BeamSocket extends EventEmitter {
   #path?: string;
   #upgradeHandler?: (req: any, socket: any, head: Buffer) => void;
   #closing = false;
+  // ── 0.2.0 cluster mesh ──
+  /** This server's own cluster node id — undefined in single-node mode. */
+  #nodeId?: number;
 
   constructor(config: BeamSocketConfig = {}) {
     super();
     this.#config = config;
+    if (config.cluster) {
+      validateClusterConfig(config.cluster);
+      this.#nodeId = config.cluster.nodeId;
+    }
     if (config.server) {
       // §6: https.Server hands us ciphertext — refuse loudly (verbatim message).
       if (typeof (config.server as any).setSecureContext === 'function') {
@@ -182,36 +220,46 @@ export class BeamSocket extends EventEmitter {
     return super.on(event, handler as (...args: unknown[]) => void);
   }
 
-  /** Single-socket target. Unknown/stale ids no-op at send time. */
+  /**
+   * Single-socket target. Unknown/stale ids no-op at send time. A node-
+   * prefixed id (0.2.0) naming another cluster member routes through the
+   * mesh relay (`engine.sendNode`); a same-node or unprefixed id sends
+   * locally, unchanged since 1B.
+   */
   toSocket(socketId: string): Target {
     const parsed = decodeSocketId(socketId);
-    return new Target(this.#requireEngine('toSocket'), {
-      type: 'socket',
-      hi: parsed?.hi ?? 0xffffffff, // guaranteed miss for foreign ids
-      lo: parsed?.lo ?? 0xffffffff,
-    });
+    return new Target(
+      this.#requireEngine('toSocket'),
+      {
+        type: 'socket',
+        node: parsed?.node,
+        hi: parsed?.hi ?? 0xffffffff, // guaranteed miss for foreign ids
+        lo: parsed?.lo ?? 0xffffffff,
+      },
+      this.#nodeId,
+    );
   }
 
   /** All devices of a user. Fan-out runs entirely in Rust. (Phase 1C) */
   toUser(userId: string): Target {
-    return new Target(this.#requireEngine('toUser'), { type: 'user', userId });
+    return new Target(this.#requireEngine('toUser'), { type: 'user', userId }, this.#nodeId);
   }
 
   /** Room target; fan-out (with .except()) runs entirely in Rust. */
   toRoom(room: string): Target {
-    return new Target(this.#requireEngine('toRoom'), { type: 'room', room });
+    return new Target(this.#requireEngine('toRoom'), { type: 'room', room }, this.#nodeId);
   }
 
   /** Every live connection. One FFI call regardless of connection count. */
   broadcast(data: Buffer | string): void {
-    new Target(this.#requireEngine('broadcast'), { type: 'all' }).send(data);
+    new Target(this.#requireEngine('broadcast'), { type: 'all' }, this.#nodeId).send(data);
   }
 
   /** Room presence — `[{ id, userId, metadata }]`. (Phase 1D) */
   presence(room: string): Presence {
     return new Presence(this.#requireEngine('presence'), room, (hi, lo) => {
       // Metadata lives on the live Socket; absent (evicted / remote) → {}.
-      return this.#sockets.get(socketKey(hi, lo))?.metadata ?? {};
+      return this.#sockets.get(encodeSocketId(hi, lo, this.#nodeId))?.metadata ?? {};
     });
   }
 
@@ -243,7 +291,8 @@ export class BeamSocket extends EventEmitter {
     return this.#mapMetrics(this.#requireEngine('metrics').stats());
   }
 
-  /** Full runtime snapshot: counters + uptime + sampler rates (Phase 2A). */
+  /** Full runtime snapshot: counters + uptime + sampler rates (Phase 2A) +
+   * cluster mesh state (0.2.0 — absent when single-node). */
   stats(): Stats {
     const s = this.#requireEngine('stats').stats();
     return {
@@ -257,6 +306,18 @@ export class BeamSocket extends EventEmitter {
             bytesOut: { perSec1s: s.rates.bytesOut1S, perSec10s: s.rates.bytesOut10S },
           }
         : null,
+      cluster: s.cluster
+        ? {
+            nodeId: s.cluster.nodeId,
+            peers: s.cluster.peers,
+            relayIn: s.cluster.relayIn,
+            relayOut: s.cluster.relayOut,
+            relayDrops: s.cluster.relayDrops,
+            peerPressures: s.cluster.peerPressures.map(
+              (p): [number, number] => [p.nodeId, p.pressure],
+            ),
+          }
+        : undefined,
     };
   }
 
@@ -519,16 +580,16 @@ export class BeamSocket extends EventEmitter {
         if (authReq) {
           info = this.#pendingAuth.take(reqKey(authReq.hi, authReq.lo));
         }
-        const socket = new Socket(engine, hi, lo, info?.userId, info?.metadata);
+        const socket = new Socket(engine, hi, lo, info?.userId, info?.metadata, this.#nodeId);
         this.#sockets.set(socket.id, socket);
         this.emit('connection', socket);
       },
       onMessage: (hi, lo, payload, isBinary) => {
         // Zero-copy view straight through to the app handler.
-        this.#sockets.get(socketKey(hi, lo))?.emit('message', payload, isBinary);
+        this.#sockets.get(encodeSocketId(hi, lo, this.#nodeId))?.emit('message', payload, isBinary);
       },
       onClose: (hi, lo, code, reason) => {
-        const key = socketKey(hi, lo);
+        const key = encodeSocketId(hi, lo, this.#nodeId);
         const socket = this.#sockets.get(key);
         if (socket) {
           this.#sockets.delete(key);
@@ -580,8 +641,4 @@ export class BeamSocket extends EventEmitter {
         engine.resolveAuthorize(reqHi, reqLo, false, '', false, RejectCode.AUTH_ERROR);
       });
   }
-}
-
-function socketKey(hi: number, lo: number): string {
-  return `${hi.toString(36)}-${lo.toString(36)}`;
 }

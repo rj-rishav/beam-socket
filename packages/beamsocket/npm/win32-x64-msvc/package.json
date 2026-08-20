@@ -1,6 +1,6 @@
 {
   "name": "beamsocket-win32-x64-msvc",
-  "version": "0.1.0-alpha.0",
+  "version": "0.2.0",
   "os": ["win32"],
   "cpu": ["x64"],
   "main": "beamsocket.win32-x64-msvc.node",

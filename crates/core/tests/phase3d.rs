@@ -478,7 +478,7 @@ fn single_node_is_zero_cost_and_bit_identical() {
     assert!(engine.cluster_peer_pressures().is_empty());
 
     // A broadcast to a room nobody is in: unchanged behavior, no mesh touched.
-    let r = engine.broadcast_room("nobody", Bytes::from_static(b"x"), false, &[]);
+    let r = engine.broadcast_room("nobody", Bytes::from_static(b"x"), false, &[], &[]);
     assert_eq!(r.attempted, 0);
 
     // Measured single-node verb overhead — the zero-cost-when-unused number for
@@ -487,7 +487,7 @@ fn single_node_is_zero_cost_and_bit_identical() {
     let n = 300_000u32;
     let t = std::time::Instant::now();
     for _ in 0..n {
-        let _ = engine.broadcast_room("nobody", payload.clone(), false, &[]);
+        let _ = engine.broadcast_room("nobody", payload.clone(), false, &[], &[]);
     }
     let per = t.elapsed().as_nanos() as f64 / n as f64;
     eprintln!("single-node broadcast_room overhead: {per:.1} ns/call over {n} calls");
