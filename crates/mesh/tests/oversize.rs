@@ -40,8 +40,23 @@ async fn oversize_frame_closes_link_counted_no_resync() {
         .await
         .unwrap();
     // A perfectly valid frame right after. It must NOT be processed: the stream
-    // is closed, and there is no resync.
-    write_raw_frame(&mut client, 2, 0x04, 0, &[]).await.unwrap();
+    // is closed, and there is no resync. How fast the server tears down its
+    // end after the oversize close is a race with this write: a broken pipe /
+    // connection reset here means the peer was already gone, which is itself
+    // evidence the link closed promptly — not a test failure. Only an error
+    // that ISN'T "peer already gone" is unexpected.
+    if let Err(e) = write_raw_frame(&mut client, 2, 0x04, 0, &[]).await {
+        let io_err = e
+            .downcast_ref::<std::io::Error>()
+            .expect("write_raw_frame only ever returns an io::Error");
+        assert!(
+            matches!(
+                io_err.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "unexpected error writing the post-oversize frame: {io_err}"
+        );
+    }
 
     let closed = poll_until(
         || server.state() == LinkState::Closed,
