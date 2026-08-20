@@ -4,6 +4,30 @@
 
 Rust data plane, JavaScript control plane. Maximum connections, minimum overhead.
 
+```bash
+npm install beamsocket@alpha
+```
+
+> **Live on npm** (`0.1.0-alpha.0`, `alpha` tag). Prebuilt binaries for
+> **linux-x64, macOS arm64, Windows x64** — no toolchain needed. Verified
+> end-to-end from the published package: install → boot a server → echo a
+> client. It's an alpha — single-node today, three platforms, headline perf
+> numbers still pending a pinned-box run (see [benchmarks](benchmarks/REPORT.md),
+> which publishes the losses too). Install pulls under the `alpha` tag; plain
+> `npm install beamsocket` waits for a `latest` release.
+
+```ts
+import { BeamSocket } from 'beamsocket';
+
+const io = new BeamSocket({});
+io.on('connection', (socket) => {
+  socket.join('lobby');
+  socket.on('message', (data) => socket.send(data)); // echo
+});
+io.toRoom('lobby').send('hello everyone');            // fan-out runs in Rust
+await io.listen(8080);
+```
+
 **Status:** `0.1.0-alpha.0` — **Phase 1 + 1.1 merged to master** (echo, rooms,
 broadcast, identity, admission limits, presence, metrics, graceful close, HTTP
 attach), all gates closed in sequence; 60 Rust + 26 JS tests green on the merged

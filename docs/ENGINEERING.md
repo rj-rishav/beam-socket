@@ -400,3 +400,33 @@ existing 112-test suite green untouched.
 Distributed presence/identity state (Phase 4 — the mesh carries frames, not
 state), mTLS (RFC 0003 seam), node autodiscovery beyond seeds, N > 50
 topologies, any delivery guarantee stronger than single-node 1C semantics.
+
+---
+
+## 14. The road to 1.0 (from 0.1.0-alpha, live on npm)
+
+**What 1.0 means here:** the WebSocket runtime with clustering, on the
+platforms production runs on, with **measured** (not projected) headline
+numbers, a frozen API under a semver promise, and at least a little real-world
+mileage. Phase 4 (distributed presence) and Phase 5 (new transports) are
+explicitly post-1.0.
+
+Version-gated milestones, one work order each, house rules throughout:
+
+| Version | Theme | Exit gate |
+|---|---|---|
+| **0.2.0** | Clustering reaches JavaScript | addon rebuilt with cluster config; 3-node cluster formed and verbs proven cross-node **from JS**; vendored crypto → audited `hmac`/`sha2`; `examples/cluster` runnable |
+| **0.3.0** | Runs where production runs | musl (Alpine/Docker) + arm64-linux (+ Intel-Mac back) prebuilds published; Docker example; automated install-matrix test; darwin CI runs the attach coalesced test |
+| **0.4.0** | Density pass | the 1D memory table's recoverable levers pulled (lazy control channels, adaptive read buffer, proxy-on-touch **with the presence-metadata migration first** — the recorded coupling); idle KB/conn re-measured vs uWS and published, win or lose |
+| **0.5.0** | Proven numbers | the pinned-box campaign on rented dedicated hardware: bridge-constant re-confirmation (`--gate-seconds 600`), full benchmark suite (100k-fanout <150 ms gate, echo p99, Socket.IO ≥25k), 10-min soak, 30-min mesh soak; REPORT.md v2 — every "projection" caveat retired or the claim withdrawn |
+| **0.9.0-rc** | API freeze + hardening | API audit + freeze (semver promise documented); full API reference docs; error-code registry final; security pass over authorize/limits/mesh handshake; JS-driven cluster chaos tests (kill -9, partition); permessage-deflate decision documented; deprecation policy |
+| **1.0.0** | Ship | RC bakes with no P0/P1 for 2+ weeks; **at least 2–3 external users/pilots have run it** (a 1.0 nobody has used is a number, not a milestone); `latest` dist-tag flipped |
+
+**Standing rules for the road:** losses stay published; no claim ships
+unmeasured; one milestone per work order with sequential gate closure; every
+release under the `alpha`/`next` tag until 1.0 flips `latest`.
+
+**Deliberately post-1.0:** distributed presence (Phase 4), TCP/MQTT/SSE/QUIC
+(Phase 5), engine-side TLS (RFC 0003 — TLS-at-LB stays the blessed topology),
+Windows fd-handoff attach (standalone-port fallback stands), permessage-deflate
+unless the 0.9 decision says otherwise.
