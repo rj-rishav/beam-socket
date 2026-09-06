@@ -3,7 +3,7 @@
 All notable changes to the `beamsocket` npm package. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0 alphas may still move APIs.
 
-## 0.2.0 — unreleased (clustering reaches JavaScript)
+## 0.2.0 — 2026-08-20 (clustering reaches JavaScript)
 
 Cluster mesh (RFC 0004, Phase 3) is now reachable from plain JS config. Core
 already carried the mesh since Phase 3D; this release is the addon + SDK
@@ -69,7 +69,7 @@ wiring that makes it usable without touching Rust.
   FIPS 180-4 / RFC 4231 known-answer vectors regression-test the new impl;
   constant-time verification unchanged.
 
-### Release status (2026-08-20)
+### Release status
 - ✅ Full required test matrix green (3-node JS-driven formation, every
   targeting verb cross-node, wrong-secret refusal, `kill -9` survival,
   single-node zero-cost re-proof, clean exit with mesh running) — run on
@@ -78,9 +78,9 @@ wiring that makes it usable without touching Rust.
   `--features napi`), `cargo test --workspace`, `tsc`, `npm test`.
 - ✅ `examples/cluster` 3-node walkthrough run by hand (found and fixed the
   cluster-mode message-drop bug above in the process).
-- ⏳ Remaining: version tag + npm publish under the `alpha` dist-tag (see
-  `PUBLISH.md`), then regenerate `package-lock.json` against the published
-  platform packages and run the install-and-echo smoke test.
+- ✅ Published 2026-08-20 to npm under the `alpha` dist-tag; tarball
+  `beamsocket-0.2.0.tgz`, integrity verified. `package-lock.json` is
+  pinned to the published platform packages.
 - Still `alpha`, not `latest`: the pinned-box benchmark gates and RFC 0004's
   30-minute mesh soak remain open (real-hardware work, tracked in
   `docs/plans/0.3.0-performance.md` Task 4) — same honesty bar 0.1.0-alpha.0
