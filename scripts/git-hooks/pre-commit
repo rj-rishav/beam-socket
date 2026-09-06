@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Secret-leak pre-commit guard.
+# Blocks the commit if any staged file matches a known credential pattern.
+# Bypass only when you genuinely mean to: `git commit --no-verify`.
+
+set -euo pipefail
+
+PATTERNS=(
+  # Anthropic / Claude API keys
+  'sk-ant-[A-Za-z0-9_-]{20,}'
+  'sk-nry-[A-Za-z0-9_-]{20,}'
+  'sk-ai-[A-Za-z0-9_-]{20,}'
+  'sk-or-[A-Za-z0-9_-]{20,}'
+  # Generic env-var secret assignments with a real value
+  'ANTHROPIC_AUTH_TOKEN=[A-Za-z0-9._-]{10,}'
+  'ANTHROPIC_API_KEY=[A-Za-z0-9._-]{10,}'
+  'OPENAI_API_KEY=[A-Za-z0-9._-]{10,}'
+  # Stripe live keys
+  'sk_live_[A-Za-z0-9]{10,}'
+  'pk_live_[A-Za-z0-9]{10,}'
+)
+
+staged=$(git diff --cached --diff-filter=ACMR --name-only -z)
+if [ -z "${staged}" ]; then
+  exit 0
+fi
+
+fail=0
+for f in ${staged[@]}; do
+  # skip binary files
+  if ! git diff --cached -- "$f" | grep -q '^[-+]'; then
+    continue
+  fi
+  for p in "${PATTERNS[@]}"; do
+    if git diff --cached -- "$f" \
+        | grep -E "^\+[^+]" \
+        | grep -qE "$p"; then
+      echo "✗ secret-leak guard: '$f' matches pattern: $p" >&2
+      fail=1
+    fi
+  done
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "Commit blocked. Either:" >&2
+  echo "  • remove the secret, replace with a placeholder, and re-stage" >&2
+  echo "  • if the file is meant to be ignored, ensure it's in .gitignore" >&2
+  echo "  • to override (e.g. redacted sample): git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0
