@@ -262,7 +262,7 @@ async function measureFanout(port) {
   return out;
 }
 
-async function measureThroughput(port) {
+async function measureThroughput(port, payload = PAYLOAD64) {
   const clients = await openMany(port, TPUT_CONNS);
   let echoes = 0;
   let running = true;
@@ -273,7 +273,7 @@ async function measureThroughput(port) {
     const pump = () => {
       while (running && inFlight < WINDOW) {
         inFlight++;
-        c.echo(PAYLOAD64).then(() => {
+        c.echo(payload).then(() => {
           echoes++;
           inFlight--;
           if (running) pump();
@@ -287,7 +287,7 @@ async function measureThroughput(port) {
   running = false;
   await sleep(300);
   clients.forEach((c) => c.close());
-  return { conns: TPUT_CONNS, seconds: TPUT_SECS, msgsPerSec: Math.round(echoes / TPUT_SECS) };
+  return { conns: TPUT_CONNS, seconds: TPUT_SECS, payloadBytes: payload.length, msgsPerSec: Math.round(echoes / TPUT_SECS) };
 }
 
 async function main() {
@@ -295,7 +295,12 @@ async function main() {
   const server = await bootServer(port);
   const result = { lib: LIB, node: process.version, ts: new Date().toISOString() };
   try {
-    result.throughput = await measureThroughput(port);
+    // Task 3a gate: 64 B (the default, baseline) and 16 KiB (large-frame
+    // regression check; the codec read chunk at 1 KiB means a 16 KiB frame
+    // takes 16 reads into a growing storage Vec — throughput must hold
+    // within ±10% of the 4 KiB chunk number).
+    result.throughput = await measureThroughput(port, PAYLOAD64);
+    result.throughput16k = await measureThroughput(port, Buffer.alloc(16 * 1024, 0x62));
     result.latency = await measureLatency(port);
     result.fanout = await measureFanout(port);
     result.memory = await measureMemory(port, server.pid);

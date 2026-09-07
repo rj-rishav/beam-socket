@@ -43,6 +43,14 @@ use crate::transport::{
 /// for throughput on few sockets; BeamSocket's density target wants small
 /// initial buffers that grow on demand (ARCHITECTURE.md §5: "tune read
 /// buffers to 4 KB initial"). Re-validated by the 10k-idle RSS gate.
+///
+/// Task 3a (0.3.0 performance phase) tried cutting this to 1 KiB for a
+/// further ~28% idle-memory win. Rejected: at proper sample size (n=8/9,
+/// 10k-conn harness) it cost ~15-21% echo throughput on 16 KiB payloads —
+/// each large frame now needs ~4x more `read_from` calls to fill tungstenite's
+/// `ReadBuffer<CHUNK_SIZE>` chunk — which breaches this plan's explicit gate
+/// ("any regression > 10% on the big payload kills the change"). See
+/// `docs/reports/0.3.0-task3a-readbuffer.md` before re-attempting this lever.
 const READ_BUFFER_SIZE: usize = 4 * 1024;
 
 /// A TCP stream with an optional REPLAY prefix on its read side (RFC 0002 §8.3).

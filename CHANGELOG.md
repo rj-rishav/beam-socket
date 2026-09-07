@@ -3,6 +3,26 @@
 All notable changes to the `beamsocket` npm package. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0 alphas may still move APIs.
 
+## Unreleased
+
+### Changed
+- **Benchmark harness: 16 KiB large-frame throughput gate.**
+  `benchmarks/driver.mjs`'s `measureThroughput` now takes a `payload`
+  argument; the driver runs it at the existing 64 B baseline and again at
+  16 KiB (`result.throughput16k`), a permanent regression check for any
+  change to the codec's read-buffer sizing.
+
+### Investigated, not shipped
+- **Codec read-buffer shrink (0.3.0 Task 3a).** Tried cutting
+  `READ_BUFFER_SIZE` (tungstenite's codec read chunk,
+  `crates/core/src/transport/websocket.rs`) from 4 KiB to 1 KiB for a
+  further density win. Real ~27% per-connection memory reduction, but
+  20-46% echo throughput regression on 16 KiB payloads (more, smaller
+  `read_from` calls per large frame) — breaches the performance plan's
+  explicit large-frame gate. Reverted; `READ_BUFFER_SIZE` is unchanged at
+  `4 * 1024`. Full measurement and reasoning:
+  `docs/reports/0.3.0-task3a-readbuffer.md`.
+
 ## 0.2.0 — 2026-08-20 (clustering reaches JavaScript)
 
 Cluster mesh (RFC 0004, Phase 3) is now reachable from plain JS config. Core
