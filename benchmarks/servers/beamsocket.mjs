@@ -6,7 +6,11 @@ import { BeamSocket } from '../../packages/beamsocket/dist/index.js';
 const port = Number(process.argv[2]);
 const PAYLOAD = Buffer.alloc(512, 0x61);
 
-const io = new BeamSocket({});
+// Match the other servers' send buffering: ws buffers without limit and uws
+// sets maxBackpressure: 0. BeamSocket's default (64 KiB, Disconnect) would
+// cut every pipelined 16 KiB echo client with 1013 within a second — 20 in
+// flight x 16 KiB = 320 KiB — so throughput16k would measure dead sockets.
+const io = new BeamSocket({ backpressure: { highWaterMark: 16 * 1024 * 1024 } });
 
 io.on('connection', (s) => {
   s.join('bench');

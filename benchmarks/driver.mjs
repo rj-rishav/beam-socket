@@ -86,7 +86,14 @@ function openRaw(port) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`, { perMessageDeflate: false });
   ws.setMaxListeners(0);
   let msgCb = null;
-  ws.on('message', (data) => msgCb && msgCb(data));
+  // Echo replies arrive in send order on one socket: resolve FIFO, one reply
+  // per request. (A `once` listener per request made one reply resolve every
+  // outstanding request, so the pipelining window was not enforced.)
+  const pending = [];
+  ws.on('message', (data) => {
+    pending.shift()?.();
+    if (msgCb) msgCb(data);
+  });
   ws.on('error', () => {});
   return {
     ws,
@@ -97,7 +104,7 @@ function openRaw(port) {
     onMsg(cb) { msgCb = cb; },
     echo(buf) {
       return new Promise((res) => {
-        ws.once('message', () => res());
+        pending.push(res);
         ws.send(buf);
       });
     },
@@ -109,7 +116,9 @@ function openRaw(port) {
 function openSio(port) {
   const sock = ioClient(`ws://127.0.0.1:${port}`, { transports: ['websocket'], reconnection: false });
   let bcastCb = null;
+  const pending = []; // FIFO echo correlation, as in openRaw
   sock.on('bcast', (d) => bcastCb && bcastCb(d));
+  sock.on('echo', () => pending.shift()?.());
   return {
     sock,
     waitOpen: new Promise((res, rej) => {
@@ -119,7 +128,7 @@ function openSio(port) {
     onMsg(cb) { bcastCb = cb; },
     echo(buf) {
       return new Promise((res) => {
-        sock.once('echo', () => res());
+        pending.push(res);
         sock.emit('echo', buf);
       });
     },

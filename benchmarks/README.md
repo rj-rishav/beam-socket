@@ -2,12 +2,16 @@
 
 Comparisons vs `ws`, Socket.IO, uWebSockets.js. Built in Phase 1B.
 
-> **Measurement warning (2026-09-30):** `driver.mjs`'s pipelined echo promises
-> each register a `once` listener; one reply can resolve multiple requests.
-> Do not use its historical 64 B/16 KiB throughput values as an acceptance gate
-> until response accounting is fixed and results are remeasured. Sequential
-> latency is not affected by this particular defect. See the
-> [architecture review](../docs/reports/adaptive-fanout-exclusions.md#other-findings-not-silently-included-in-this-patch).
+> **Measurement correction (2026-09-30):** before this date, every
+> `throughput16k` BeamSocket number is invalid. The BeamSocket bench server ran
+> the default 64 KiB `Disconnect` send budget while `ws`/`uws` buffer without
+> limit; 20 pipelined 16 KiB echoes per client exceed it, so all 8 clients
+> were closed with 1013 within a second. The driver's `once`-per-request echo
+> listener then let one reply resolve every outstanding request, so lost
+> replies were still counted (5× overcount observed) and the pipelining window
+> was not enforced (up to 30× over its cap against `ws`). Both are fixed: the
+> bench server now matches the others' buffering, and echoes are correlated
+> FIFO. Sequential latency and fan-out were not affected.
 
 ## Honesty rules (non-negotiable)
 

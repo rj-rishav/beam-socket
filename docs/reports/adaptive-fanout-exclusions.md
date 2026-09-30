@@ -148,13 +148,14 @@ Duplicate exclusions are harmless; no deduplication pass is needed.
 
 ## Other findings, not silently included in this patch
 
-- **Benchmark validity:** `benchmarks/driver.mjs` installs a `once` listener for
-  every pipelined echo. One incoming reply resolves multiple outstanding
-  promises (also on the Socket.IO path). Historical pipelined throughput and
-  16-KiB throughput numbers need remeasurement after fixing correlation. This
-  report uses neither as an acceptance gate. The new core benchmark checks
-  actual mailbox payloads, once per selected recipient. Sequential echo latency
-  does not have that particular accounting bug.
+- **Benchmark validity:** `benchmarks/driver.mjs` installed a `once` listener for
+  every pipelined echo, so one reply resolved every outstanding promise. When
+  replies arrive, totals still match, but the window is not enforced. When
+  replies are lost they are counted anyway. Follow-up (same day): BeamSocket's
+  16-KiB replies *were* lost — the bench server used the 64 KiB `Disconnect`
+  default and every client was closed with 1013. Fixed on the
+  `perf/0.2.1-hardening` branch; see `benchmarks/README.md`. This report uses
+  neither metric as an acceptance gate.
 - Remote `toSocket` relay delivery ignores `PushOutcome::Disconnect`, unlike
   local send and broadcast. Its 1013-close behavior needs a separate fix/test.
 - Zero-byte frames consume mailbox entries but no payload-byte budget; a
