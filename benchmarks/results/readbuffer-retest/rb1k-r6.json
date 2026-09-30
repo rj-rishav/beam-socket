@@ -1,0 +1,51 @@
+{
+  "lib": "beamsocket",
+  "node": "v24.15.0",
+  "ts": "2026-09-30T10:21:13.826Z",
+  "throughput": {
+    "conns": 8,
+    "seconds": 3,
+    "payloadBytes": 64,
+    "msgsPerSec": 156567
+  },
+  "throughput16k": {
+    "conns": 8,
+    "seconds": 3,
+    "payloadBytes": 16384,
+    "msgsPerSec": 22473
+  },
+  "latency": {
+    "samples": 2000,
+    "p50ms": 0.62,
+    "p99ms": 3.193,
+    "meanms": 0.686
+  },
+  "fanout": {
+    "1000": {
+      "recipients": 1000,
+      "bestMs": 6.33,
+      "medianMs": 12.37
+    }
+  },
+  "memory": {
+    "conns": 10000,
+    "baseRssKB": 86620,
+    "baseSamplesKB": [
+      86620,
+      86620,
+      86620
+    ],
+    "loadedRssKB": 158676,
+    "rssSamplesKB": [
+      158676,
+      158676,
+      158676,
+      158676,
+      158676,
+      158676,
+      158676,
+      158676
+    ],
+    "bytesPerConn": 7379
+  }
+}

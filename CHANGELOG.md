@@ -5,6 +5,31 @@ All notable changes to the `beamsocket` npm package. This project follows
 
 ## Unreleased
 
+### Fixed
+- **Relayed `toSocket` now honours the `Disconnect` backpressure policy.** A
+  cross-node `socket.send` that overflowed a `Disconnect`-policy mailbox
+  closed the queue without signalling a close, leaving a half-dead
+  connection that later reported 1006 instead of 1013. All push sites now
+  share one helper (`ConnHandle::push`).
+- **Empty frames are bounded by the send budget.** Zero-length frames cost 0
+  budget bytes, so a slow reader could queue an unbounded number of them.
+  Each frame is now charged at least 1 byte; non-empty frames are unaffected.
+- **Benchmark harness: 16 KiB throughput was invalid.** The BeamSocket bench
+  server used the default 64 KiB `Disconnect` budget (ws/uws buffer without
+  limit), so every pipelined 16 KiB echo client was closed with 1013 within
+  about a second, and `driver.mjs` counted lost replies (one `once` listener per
+  request). Echoes are now correlated FIFO and the bench server matches the
+  other servers' buffering. All earlier `throughput16k` numbers are void.
+
+### Performance
+- **Adaptive exclusion index for fan-out.** `.except()` lists of 32+ entries on
+  targets of 64+ recipients use a temporary sorted index: 2.07–7.09× faster
+  core fan-out for 256+ exclusions, neutral for small lists.
+  Report: `docs/reports/adaptive-fanout-exclusions.md`.
+- **Codec read buffer 4 KiB → 1 KiB: ~23% less idle memory per connection**
+  (10k-connection harness, 10 alternating A/B rounds), ~2% median 16 KiB echo
+  throughput cost. Report: `docs/reports/0.2.1-hardening.md`.
+
 ### Changed
 - **Benchmark harness: 16 KiB large-frame throughput gate.**
   `benchmarks/driver.mjs`'s `measureThroughput` now takes a `payload`
@@ -13,7 +38,9 @@ All notable changes to the `beamsocket` npm package. This project follows
   change to the codec's read-buffer sizing.
 
 ### Investigated, not shipped
-- **Codec read-buffer shrink (0.3.0 Task 3a).** Tried cutting
+- **Codec read-buffer shrink (0.3.0 Task 3a)** — *superseded: shipped above
+  after re-measurement; the rejection below rested on the invalid 16 KiB
+  benchmark.* Tried cutting
   `READ_BUFFER_SIZE` (tungstenite's codec read chunk,
   `crates/core/src/transport/websocket.rs`) from 4 KiB to 1 KiB for a
   further density win. Real ~27% per-connection memory reduction, but

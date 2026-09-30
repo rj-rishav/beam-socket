@@ -44,14 +44,13 @@ use crate::transport::{
 /// initial buffers that grow on demand (ARCHITECTURE.md §5: "tune read
 /// buffers to 4 KB initial"). Re-validated by the 10k-idle RSS gate.
 ///
-/// Task 3a (0.3.0 performance phase) tried cutting this to 1 KiB for a
-/// further ~28% idle-memory win. Rejected: at proper sample size (n=8/9,
-/// 10k-conn harness) it cost ~15-21% echo throughput on 16 KiB payloads —
-/// each large frame now needs ~4x more `read_from` calls to fill tungstenite's
-/// `ReadBuffer<CHUNK_SIZE>` chunk — which breaches this plan's explicit gate
-/// ("any regression > 10% on the big payload kills the change"). See
-/// `docs/reports/0.3.0-task3a-readbuffer.md` before re-attempting this lever.
-const READ_BUFFER_SIZE: usize = 4 * 1024;
+/// 1 KiB since 0.2.1: ~23% less idle RSS per connection (10k-conn harness,
+/// n=10 alternating A/B rounds, every round -17% to -29%) for a ~2% median
+/// 16 KiB echo-throughput cost (each large frame needs ~4x more `read_from`
+/// calls to fill tungstenite's chunk). Task 3a's earlier rejection measured
+/// benchmark clients being disconnected, not the codec — see
+/// `docs/reports/0.2.1-hardening.md` before changing this again.
+const READ_BUFFER_SIZE: usize = 1024;
 
 /// A TCP stream with an optional REPLAY prefix on its read side (RFC 0002 §8.3).
 /// Reads yield `head` first, then the socket; writes pass straight through.
