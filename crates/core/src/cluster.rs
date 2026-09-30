@@ -296,7 +296,9 @@ fn deliver_local(
             let local = u64::from_le_bytes(body[0..8].try_into().unwrap());
             let payload = Bytes::copy_from_slice(&body[8..]);
             if let Some(handle) = registry.get(ConnectionId(local)) {
-                handle.mailbox.push(OutboundFrame {
+                // `ConnHandle::push`, not `mailbox.push`: a Disconnect-policy
+                // overflow must start the 1013 close, same as a local send.
+                handle.push(OutboundFrame {
                     data: payload,
                     is_binary,
                 });
@@ -353,4 +355,63 @@ fn excepts_for(self_node: u16, excepts: &[NodeConnId]) -> Vec<ConnectionId> {
         .filter(|e| e.node == self_node)
         .map(|e| e.local)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackpressurePolicy;
+    use crate::connection::backpressure::Mailbox;
+    use crate::connection::{CloseSignal, ConnHandle, Control, CLOSE_BACKPRESSURE};
+
+    /// A relayed `toSocket` that overflows a Disconnect-policy mailbox must
+    /// close the connection with 1013, exactly like a local `send` does.
+    /// Without the close signal the mailbox is closed but the reader keeps
+    /// running: a half-dead connection that later reports 1006, not 1013.
+    #[test]
+    fn relayed_socket_send_honours_disconnect_policy() {
+        let registry = Arc::new(Registry::new());
+        let metrics = Arc::new(Metrics::default());
+        let (control, mut control_rx) = tokio::sync::mpsc::channel::<Control>(4);
+        let (close, close_rx) = CloseSignal::new();
+        let handle = ConnHandle {
+            mailbox: Mailbox::new(4, BackpressurePolicy::Disconnect, metrics.clone()),
+            control,
+            close,
+        };
+        let id = registry.insert(handle, None);
+        let relay_body = |payload: &[u8]| {
+            let mut body = id.0.to_le_bytes().to_vec();
+            body.extend_from_slice(payload);
+            body
+        };
+        let deliver = |body: &[u8]| {
+            deliver_local(
+                &registry,
+                &Arc::new(RoomRegistry::new()),
+                &Arc::new(IdentityRegistry::new()),
+                &metrics,
+                &Arc::new(RelayCounters::default()),
+                1,
+                RelayKind::Socket,
+                false,
+                body,
+            )
+        };
+
+        deliver(&relay_body(b"fill")); // fits the 4-byte budget
+        assert!(close_rx.borrow().is_none(), "no close while under budget");
+        deliver(&relay_body(b"overflow")); // exceeds it → Disconnect
+
+        let cmd = close_rx.borrow().clone().expect("close must be signalled");
+        assert_eq!(cmd.code, CLOSE_BACKPRESSURE);
+        assert!(cmd.graceful);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(Control::Close {
+                code: CLOSE_BACKPRESSURE,
+                ..
+            })
+        ));
+    }
 }

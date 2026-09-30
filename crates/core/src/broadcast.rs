@@ -15,7 +15,7 @@ use bytes::Bytes;
 
 use crate::connection::backpressure::{OutboundFrame, PushOutcome};
 use crate::connection::registry::Registry;
-use crate::connection::{ConnHandle, CLOSE_BACKPRESSURE};
+use crate::connection::ConnHandle;
 use crate::identity::IdentityRegistry;
 use crate::ids::{ConnectionId, RoomId, UserId};
 use crate::rooms::RoomRegistry;
@@ -147,15 +147,13 @@ impl<'a> Exclusions<'a> {
 }
 
 fn push_one(handle: &ConnHandle, payload: &Bytes, is_binary: bool, report: &mut FanoutReport) {
-    match handle.mailbox.push(OutboundFrame {
+    match handle.push(OutboundFrame {
         data: payload.clone(), // refcount bump — THE point of this module
         is_binary,
     }) {
         PushOutcome::Queued => report.queued += 1,
-        PushOutcome::DroppedNewest | PushOutcome::DroppedOldest => report.backpressured += 1,
-        PushOutcome::Disconnect => {
-            handle.initiate_close(CLOSE_BACKPRESSURE, "backpressure", true);
-            report.backpressured += 1;
+        PushOutcome::DroppedNewest | PushOutcome::DroppedOldest | PushOutcome::Disconnect => {
+            report.backpressured += 1
         }
         PushOutcome::Closed => report.missing += 1,
     }

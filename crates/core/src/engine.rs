@@ -19,8 +19,7 @@ use crate::config::{Config, ConfigError};
 use crate::connection::backpressure::{Mailbox, OutboundFrame, PushOutcome};
 use crate::connection::registry::Registry;
 use crate::connection::{
-    run_connection, CloseSignal, ConnCtx, ConnHandle, CLOSE_BACKPRESSURE, CLOSE_GOING_AWAY,
-    CONTROL_QUEUE_CAPACITY,
+    run_connection, CloseSignal, ConnCtx, ConnHandle, CLOSE_GOING_AWAY, CONTROL_QUEUE_CAPACITY,
 };
 use crate::events::{EngineEvent, EventSender};
 use crate::identity::{AuthorizeOutcome, AuthorizeResolution, Authorizer, IdentityRegistry};
@@ -1024,11 +1023,9 @@ impl Engine {
         let Some(handle) = self.registry.get(id) else {
             return SendStatus::NotFound;
         };
-        match handle.mailbox.push(OutboundFrame { data, is_binary }) {
+        match handle.push(OutboundFrame { data, is_binary }) {
             PushOutcome::Queued => SendStatus::Queued,
-            PushOutcome::DroppedNewest | PushOutcome::DroppedOldest => SendStatus::Backpressure,
-            PushOutcome::Disconnect => {
-                handle.initiate_close(CLOSE_BACKPRESSURE, "backpressure", true);
+            PushOutcome::DroppedNewest | PushOutcome::DroppedOldest | PushOutcome::Disconnect => {
                 SendStatus::Backpressure
             }
             PushOutcome::Closed => SendStatus::NotFound,

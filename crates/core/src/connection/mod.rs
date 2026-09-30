@@ -129,6 +129,18 @@ impl ConnHandle {
             reason: reason.into(),
         });
     }
+
+    /// Enqueue one outbound frame, enforcing the `Disconnect` policy: when it
+    /// fires, the mailbox is already closed and this starts the 1013 close.
+    /// Every push site (local send, fan-out, relayed send) must go through
+    /// here — a bare `mailbox.push` leaves a half-dead connection.
+    pub fn push(&self, frame: OutboundFrame) -> backpressure::PushOutcome {
+        let outcome = self.mailbox.push(frame);
+        if outcome == backpressure::PushOutcome::Disconnect {
+            self.initiate_close(CLOSE_BACKPRESSURE, "backpressure", true);
+        }
+        outcome
+    }
 }
 
 /// Everything a connection task shares with the engine.
