@@ -1,7 +1,8 @@
 //! Bounded send queue ("mailbox") + high-water mark — Phase 1A.
 //!
 //! Every connection's outbound path goes through this queue. It is bounded in
-//! BYTES by `config.backpressure.high_water_mark` (Rule 5) and the overflow
+//! BYTES by `config.backpressure.high_water_mark` (Rule 5; an empty frame is
+//! charged as 1 byte so entry count is bounded too) and the overflow
 //! behavior is the configured `BackpressurePolicy`. Every overflow increments
 //! `metrics.backpressure_drops` — never silent (RFC 0001 primary-gate
 //! philosophy).
@@ -44,6 +45,13 @@ pub enum PushOutcome {
     Disconnect,
     /// Mailbox already closed (connection tearing down).
     Closed,
+}
+
+/// Budget cost of one queued frame: its payload bytes, but at least 1, so
+/// zero-length frames cannot queue without bound (entries <= HWM bytes).
+#[inline]
+fn charge(frame: &OutboundFrame) -> usize {
+    frame.data.len().max(1)
 }
 
 struct Inner {
@@ -94,7 +102,7 @@ impl Mailbox {
         if q.closed {
             return PushOutcome::Closed;
         }
-        let len = frame.data.len();
+        let len = charge(&frame);
         if q.bytes + len > inner.high_water_mark && !q.items.is_empty() {
             match inner.policy {
                 BackpressurePolicy::Disconnect => {
@@ -113,7 +121,7 @@ impl Mailbox {
                     while q.bytes + len > inner.high_water_mark {
                         match q.items.pop_front() {
                             Some(old) => {
-                                q.bytes -= old.data.len();
+                                q.bytes -= charge(&old);
                                 dropped += 1;
                             }
                             None => break,
@@ -141,7 +149,7 @@ impl Mailbox {
             {
                 let mut q = self.inner.queue.lock().unwrap();
                 if let Some(f) = q.items.pop_front() {
-                    q.bytes -= f.data.len();
+                    q.bytes -= charge(&f);
                     return Some(f);
                 }
                 if q.closed {
@@ -214,6 +222,25 @@ mod tests {
         let (mb, m) = mailbox(BackpressurePolicy::Disconnect, 10);
         assert_eq!(mb.push(frame(1000)), PushOutcome::Queued);
         assert_eq!(Metrics::get(&m.backpressure_drops), 0);
+    }
+
+    /// Empty frames used to cost 0 budget bytes, so a slow reader could queue
+    /// an unbounded number of them (~40 B of VecDeque entry each). They are
+    /// now charged like a 1-byte frame: never more entries than HWM bytes.
+    #[test]
+    fn empty_frames_are_bounded_by_the_budget() {
+        for policy in [
+            BackpressurePolicy::DropNewest,
+            BackpressurePolicy::DropOldest,
+            BackpressurePolicy::Disconnect,
+        ] {
+            let (mb, _) = mailbox(policy, 64);
+            let queued = (0..10_000)
+                .filter(|_| mb.push(frame(0)) == PushOutcome::Queued)
+                .count();
+            assert_eq!(queued, 64, "{policy:?}");
+            assert_eq!(mb.queued_bytes(), 64, "{policy:?}");
+        }
     }
 
     #[tokio::test]
