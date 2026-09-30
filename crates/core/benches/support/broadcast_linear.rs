@@ -1,3 +1,5 @@
+//! Frozen d961332 fan-out reference for same-process A/B benchmarks.
+//! Keep the algorithm unchanged; production lives in src/broadcast.rs.
 //! Fan-out engine — Phase 1B.
 //!
 //! The payload is serialized ONCE into `Bytes` (at the FFI boundary — the
@@ -80,10 +82,8 @@ pub fn broadcast(
         FanoutTarget::All => {
             // Snapshot of live handles; collected under shard locks, pushed
             // outside them (Registry::handles contract).
-            let handles = conns.handles();
-            let except = Exclusions::new(except, handles.len());
-            for (id, handle) in handles {
-                if except.contains(id) {
+            for (id, handle) in conns.handles() {
+                if except.contains(&id) {
                     continue;
                 }
                 push_one(&handle, &payload, is_binary, &mut report);
@@ -105,9 +105,8 @@ fn fan_out_ids(
     except: &[ConnectionId],
     report: &mut FanoutReport,
 ) {
-    let except = Exclusions::new(except, ids.len());
     for id in ids {
-        if except.contains(id) {
+        if except.contains(&id) {
             continue;
         }
         match conns.get(id) {
@@ -115,34 +114,6 @@ fn fan_out_ids(
             None => report.missing += 1,
         }
         report.attempted += 1;
-    }
-}
-
-/// Temporary, full-ID membership index. Keep tiny lists/targets allocation-free.
-/// The recipient guard also bounds scratch to at most 8 bytes per recipient
-/// and avoids sorting huge lists for a few probes (especially early hits).
-/// Crossover evidence: docs/reports/adaptive-fanout-exclusions.md.
-enum Exclusions<'a> {
-    Linear(&'a [ConnectionId]),
-    Sorted(Vec<ConnectionId>),
-}
-
-impl<'a> Exclusions<'a> {
-    fn new(except: &'a [ConnectionId], recipients: usize) -> Self {
-        if except.len() >= 32 && recipients >= 64 && recipients >= except.len() {
-            let mut sorted = except.to_vec();
-            sorted.sort_unstable_by_key(|id| id.0);
-            Self::Sorted(sorted)
-        } else {
-            Self::Linear(except)
-        }
-    }
-
-    fn contains(&self, id: ConnectionId) -> bool {
-        match self {
-            Self::Linear(except) => except.contains(&id),
-            Self::Sorted(except) => except.binary_search_by_key(&id.0, |x| x.0).is_ok(),
-        }
     }
 }
 
@@ -158,44 +129,5 @@ fn push_one(handle: &ConnHandle, payload: &Bytes, is_binary: bool, report: &mut 
             report.backpressured += 1;
         }
         PushOutcome::Closed => report.missing += 1,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-
-    #[test]
-    fn index_only_allocates_when_both_cardinalities_justify_it() {
-        for exclusions in [0, 1, 31, 32, 33, 63, 64, 65, 127, 128] {
-            let except = vec![ConnectionId::new(1, 2, 3); exclusions];
-            for recipients in [0, 1, 31, 32, 63, 64, 65, 127, 128] {
-                let index = Exclusions::new(&except, recipients);
-                let should_sort = exclusions >= 32 && recipients >= 64 && recipients >= exclusions;
-                assert_eq!(matches!(index, Exclusions::Sorted(_)), should_sort);
-                if let Exclusions::Linear(slice) = index {
-                    assert_eq!(slice.as_ptr(), except.as_ptr(), "small path must borrow");
-                }
-            }
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
-        #[test]
-        fn adaptive_membership_matches_slice_for_full_width_ids(
-            raw in proptest::collection::vec(any::<u64>(), 0..256),
-            probes in proptest::collection::vec(any::<u64>(), 0..128),
-        ) {
-            let except: Vec<_> = raw.iter().copied().map(ConnectionId).collect();
-            for recipients in [0, 1, 63, 64, 128, 256, 4096] {
-                let index = Exclusions::new(&except, recipients);
-                for id in raw.iter().chain(&probes).copied().map(ConnectionId) {
-                    prop_assert_eq!(index.contains(id), except.contains(&id));
-                }
-            }
-            prop_assert_eq!(except.iter().map(|id| id.0).collect::<Vec<_>>(), raw);
-        }
     }
 }

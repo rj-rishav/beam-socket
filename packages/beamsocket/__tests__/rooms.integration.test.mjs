@@ -100,3 +100,47 @@ test('rooms: join/leave, toRoom().except(), toSocket, io.broadcast', async () =>
   c.ws.close(1000);
   await io.close();
 });
+
+test('large chained exclusions reach only intended room/user members, exactly once', async (t) => {
+  const io = new BeamSocket({});
+  io.authorize(() => ({ accept: true, userId: 'exclusion-user' }));
+  const clients = [];
+  t.after(async () => {
+    for (const { ws } of clients) ws.terminate();
+    await io.close({ timeoutMs: 2000 });
+  });
+  const port = await io.listen(0);
+  // Both R >= 64 and E >= 32: exercise the indexed path through the real FFI.
+  for (let i = 0; i < 80; i++) {
+    const client = await connect(io, port);
+    client.socket.join('indexed');
+    clients.push(client);
+  }
+  for (const kind of ['room', 'user']) {
+    const marker = `barrier-${kind}`;
+    const seen = clients.map(() => []);
+    const listeners = [];
+    const barriers = clients.map(({ ws }, i) => withTimeout(new Promise((resolve) => {
+      const listener = (data, binary) => {
+        if (!binary && data.toString() === marker) resolve();
+        else seen[i].push([Buffer.from(data), binary]);
+      };
+      listeners.push(listener);
+      ws.on('message', listener);
+    }), 5000, `${kind} delivery barrier ${i}`));
+    const target = kind === 'room' ? io.toRoom('indexed') : io.toUser('exclusion-user');
+    for (let i = 0; i < 40; i++) target.except(clients[i].socket.id);
+    target.except(clients[0].socket.id); // duplicate exclusions do not change delivery
+    const payload = kind === 'room' ? Buffer.from([0, 42, 255]) : 'indexed text';
+    target.send(payload);
+    // Per-socket FIFO markers prove all earlier frames were observed without
+    // a sleep-based negative assertion or counting duplicates as recipients.
+    for (const { socket } of clients) io.toSocket(socket.id).send(marker);
+    await Promise.all(barriers);
+    for (let i = 0; i < clients.length; i++) {
+      clients[i].ws.off('message', listeners[i]);
+      assert.deepEqual(seen[i], i < 40 ? [] : [[Buffer.from(payload), kind === 'room']],
+        `${kind} recipient ${i}`);
+    }
+  }
+});

@@ -2,6 +2,13 @@
 
 Comparisons vs `ws`, Socket.IO, uWebSockets.js. Built in Phase 1B.
 
+> **Measurement warning (2026-09-30):** `driver.mjs`'s pipelined echo promises
+> each register a `once` listener; one reply can resolve multiple requests.
+> Do not use its historical 64 B/16 KiB throughput values as an acceptance gate
+> until response accounting is fixed and results are remeasured. Sequential
+> latency is not affected by this particular defect. See the
+> [architecture review](../docs/reports/adaptive-fanout-exclusions.md#other-findings-not-silently-included-in-this-patch).
+
 ## Honesty rules (non-negotiable)
 
 1. uWebSockets.js is always included.
@@ -127,6 +134,17 @@ churns a throwaway connection batch before sampling "base," so both the
 base and loaded readings get the same allocator-settling treatment — without
 that, base and loaded aren't measuring the same thing and the delta is
 meaningless.
+
+## Core exclusion A/B benchmark
+
+From the repository root, run `cargo bench -p beamsocket-core --bench
+fanout_exclusions` for a same-process comparison of frozen linear fan-out and
+current production fan-out. `cargo bench -p beamsocket-core --bench
+exclusion_filter` compares lookup strategies including index construction.
+Both emit CSV. Full methodology, raw-result paths, losses, and regression checks
+are in the [adaptive exclusions report](../docs/reports/adaptive-fanout-exclusions.md).
+These measure core snapshot/filter/enqueue cost, **not network completion** or
+competitor throughput, and do not replace the pinned-box gates.
 
 ## Running
 

@@ -23,9 +23,16 @@ ipnet = "2"
 # present (single-node builds link it but spawn nothing).
 beamsocket-mesh = { path = "../mesh" }
 
+[[bench]]
+name = "exclusion_filter"
+harness = false
+
+[[bench]]
+name = "fanout_exclusions"
+harness = false
+
 [dev-dependencies]
 proptest = "1" # Phase 1B membership property tests
-# criterion = "0.5"   # micro-benchmarks
 # Phase 3D gate tests reach the mesh's `RelayKind` directly for the partition
 # drop-accounting assertion (already a normal dep of this crate).
 beamsocket-mesh = { path = "../mesh" }
