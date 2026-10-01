@@ -35,29 +35,48 @@ async fn slow_reader_drops_and_counts_never_blocks_then_recovers() {
     let a = Link::connect(addr, a_cfg).await.unwrap();
     let mut b_stream = b_join.await.unwrap();
 
-    // Blast far more than the socket buffers + HWM can hold. `try_send` is
-    // synchronous and non-blocking, so this loop returns promptly even though
-    // the peer is not reading at all.
+    // Saturate the link. Loopback kernel buffers can absorb tens of MiB from a
+    // peer that reads nothing (stock Linux `tcp_rmem` max is 32 MiB, plus the
+    // sender's `tcp_wmem`), so a fixed 4 MB blast was not "more than the
+    // buffers can hold": on a 2-CPU box the writer often moved all of it into
+    // the kernel and the gauge read 0 (5/20 failures in the fixed-resource
+    // container). Instead, blast in rounds until the queue is STILL full 50 ms
+    // after a round — the writer can no longer drain it, so the peer's stall
+    // has reached the sender. Bounded by time and volume.
+    //
+    // `try_send` is synchronous and non-blocking, so every round must return
+    // promptly even though the peer is not reading at all.
     let payload = vec![0x42u8; 200];
-    let start = std::time::Instant::now();
-    for _ in 0..20_000 {
-        let _ = a.try_send(Frame::new(FrameKind::Membership, payload.clone()));
-    }
-    let enqueue_elapsed = start.elapsed();
-    assert!(
-        enqueue_elapsed < Duration::from_secs(2),
-        "the enqueuer must not block on a slow peer (took {enqueue_elapsed:?})"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut sent = 0usize;
+    let saturated = loop {
+        let start = std::time::Instant::now();
+        for _ in 0..20_000 {
+            let _ = a.try_send(Frame::new(FrameKind::Membership, payload.clone()));
+        }
+        sent += 20_000;
+        let enqueue_elapsed = start.elapsed();
+        assert!(
+            enqueue_elapsed < Duration::from_secs(2),
+            "the enqueuer must not block on a slow peer (round took {enqueue_elapsed:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if a.pressure() > 0.5 {
+            break true;
+        }
+        if std::time::Instant::now() > deadline || sent >= 1_000_000 {
+            break false;
+        }
+    };
 
     // Overflow: drops counted, pressure gauge high.
-    let dropped = poll_until(|| a.drops() > 0, Duration::from_secs(2)).await;
     assert!(
-        dropped,
+        a.drops() > 0,
         "a stalled peer must make the sender drop-and-count"
     );
     assert!(
-        a.pressure() > 0.5,
-        "pressure gauge should be high while the peer is stalled (was {})",
+        saturated,
+        "pressure gauge should stay high while the peer is stalled (was {} after {sent} frames)",
         a.pressure()
     );
 
