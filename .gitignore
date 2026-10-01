@@ -13,3 +13,5 @@ npm-debug.log*
 *.swp
 .claude/settings.json
 .claude/settings.local.json
+
+.artifacts/

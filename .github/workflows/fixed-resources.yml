@@ -1,0 +1,46 @@
+name: Fixed-resource validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Previous version to compare against (commit, tag or branch)
+        default: d961332
+      rounds:
+        description: End-to-end A/B rounds
+        default: '6'
+  push:
+    branches: [main]
+  pull_request:
+
+# Deliberately separate from the hosted-runner CI jobs. The test processes,
+# not merely the job, run in Alpine containers pinned to 2 CPUs with a hard
+# 2 GiB / no-swap cgroup, so correctness and performance are compared between
+# the previous and current trees under an identical budget.
+jobs:
+  containerized:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify + bench (Alpine, 2 CPU / 2 GiB, previous vs current)
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref || 'd961332' }}
+          ROUNDS: ${{ inputs.rounds || '6' }}
+          OUTPUT_DIR: .artifacts/fixed-test
+          NO_CACHE: '1'
+        run: ./scripts/docker-fixed-test.sh
+      - name: Job summary
+        if: always()
+        run: cat .artifacts/fixed-test/evaluation.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload fixed-resource evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beamsocket-fixed-resource-results
+          path: |
+            .artifacts/fixed-test/
+            !.artifacts/fixed-test/build/
+          if-no-files-found: warn

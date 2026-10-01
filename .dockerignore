@@ -1,0 +1,15 @@
+# Keep the full .git object database: the fixed-test entrypoint archives the
+# exact baseline ref from it. Exclude generated trees and local-only artifacts.
+target
+**/target
+node_modules
+**/node_modules
+packages/beamsocket/dist
+packages/beamsocket/native/beamsocket.node
+.artifacts
+.lavish
+__agent__
+benchmarks/oci
+benchmarks/results/*.csv
+*.log
+.DS_Store

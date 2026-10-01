@@ -12,6 +12,7 @@
 // equivalent (client-observed); the transport under each is that library's own.
 //
 // Usage: node driver.mjs --lib <ws|uws|socketio|beamsocket> [--out results/x.json]
+//        [--only throughput,throughput16k,latency,fanout,memory]  (default: all)
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { writeFileSync } from 'node:fs';
@@ -33,6 +34,7 @@ const MEM_SETTLE_MS = Number(args.memSettleMs ?? 8000);
 const MEM_SAMPLES = Number(args.memSamples ?? 8);
 const FANOUT_SIZES = (args.fanout ?? '1000,3000,5000').split(',').map(Number);
 const FANOUT_REPS = 5;
+const ONLY = new Set((args.only ?? 'throughput,throughput16k,latency,fanout,memory').split(','));
 const LAT_CONNS = 50;
 const LAT_SAMPLES = 2000;
 const TPUT_CONNS = 8;
@@ -308,11 +310,11 @@ async function main() {
     // regression check; the codec read chunk at 1 KiB means a 16 KiB frame
     // takes 16 reads into a growing storage Vec — throughput must hold
     // within ±10% of the 4 KiB chunk number).
-    result.throughput = await measureThroughput(port, PAYLOAD64);
-    result.throughput16k = await measureThroughput(port, Buffer.alloc(16 * 1024, 0x62));
-    result.latency = await measureLatency(port);
-    result.fanout = await measureFanout(port);
-    result.memory = await measureMemory(port, server.pid);
+    if (ONLY.has('throughput')) result.throughput = await measureThroughput(port, PAYLOAD64);
+    if (ONLY.has('throughput16k')) result.throughput16k = await measureThroughput(port, Buffer.alloc(16 * 1024, 0x62));
+    if (ONLY.has('latency')) result.latency = await measureLatency(port);
+    if (ONLY.has('fanout')) result.fanout = await measureFanout(port);
+    if (ONLY.has('memory')) result.memory = await measureMemory(port, server.pid);
   } finally {
     server.kill('SIGKILL');
   }

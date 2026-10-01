@@ -137,4 +137,5 @@ process.on('SIGTERM', () => io.close({ timeoutMs: 30_000 })); // drain, then exi
 - `crates/node` — NAPI-RS binding
 - `packages/beamsocket` — the npm package (TypeScript SDK)
 - `benchmarks/` — honest comparisons vs ws / Socket.IO / uWebSockets.js
+- `docker/fixed-test/` + `scripts/docker-fixed-test.sh` — reproducible Alpine validation and end-to-end A/B of a previous ref vs the current tree, pinned to 2 CPUs / 2 GiB (see [docs/reports/containerized-validation.md](docs/reports/containerized-validation.md))
 - `spike/` — RFC 0001 bridge spike (throwaway; the winner graduated into `crates/node`)
