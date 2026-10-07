@@ -894,7 +894,7 @@ impl BeamEngine {
         // Flat [k0,v0,k1,v1,…] → (lowercased key, value) pairs (same shape the
         // own-port handshake captures).
         let mut headers = Vec::with_capacity(headers_flat.len() / 2);
-        for pair in headers_flat.chunks_exact(2) {
+        for pair in headers_flat.as_chunks::<2>().0 {
             headers.push((pair[0].to_ascii_lowercase(), pair[1].clone()));
         }
         let parsed = ParsedUpgrade {
@@ -969,7 +969,12 @@ fn membership_code(c: MembershipChange) -> u32 {
 /// Decode the flat [hi, lo, hi, lo, …] except list (a trailing odd half is a
 /// caller bug and is ignored).
 fn except_ids(pairs: &Uint32Array) -> Vec<ConnectionId> {
-    pairs.chunks_exact(2).map(|p| conn_id(p[0], p[1])).collect()
+    pairs
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| conn_id(p[0], p[1]))
+        .collect()
 }
 
 /// Decode the flat [node, hi, lo, node, hi, lo, …] remote-except list (0.2.0)
@@ -977,7 +982,9 @@ fn except_ids(pairs: &Uint32Array) -> Vec<ConnectionId> {
 /// `except_ids`. Empty in every single-node call.
 fn except_ids_remote(triples: &Uint32Array) -> Vec<NodeConnId> {
     triples
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|t| NodeConnId {
             node: t[0] as u16,
             local: conn_id(t[1], t[2]),
