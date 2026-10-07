@@ -383,11 +383,22 @@ impl MeshNode {
         config: MeshConfig,
         relay_handler: Option<RelayHandler>,
     ) -> std::io::Result<Arc<MeshNode>> {
-        // Bind UDP first so we can bind TCP to the same (possibly :0-resolved)
-        // port — peers reach both planes at one address.
-        let udp = Arc::new(UdpSocket::bind(config.listen).await?);
-        let addr = udp.local_addr()?;
-        let listener = TcpListener::bind(addr).await?;
+        // Reserve the TCP port first, then bind UDP to the same (possibly
+        // :0-resolved) port. Binding UDP first leaves a race where another
+        // parallel test can claim the TCP port before we do; if the UDP bind
+        // loses an ephemeral-port race, release the TCP reservation and retry.
+        let (udp, listener, addr) = loop {
+            let listener = TcpListener::bind(config.listen).await?;
+            let addr = listener.local_addr()?;
+            match UdpSocket::bind(addr).await {
+                Ok(udp) => break (Arc::new(udp), listener, addr),
+                Err(_error) if config.listen.port() == 0 => {
+                    drop(listener);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         let membership = Arc::new(Mutex::new(Membership::new(config.node_id, addr)));
         let deny = Arc::new(Mutex::new(HashSet::new()));
