@@ -73,9 +73,7 @@ impl Sim {
     }
 
     fn heal(&mut self) {
-        for g in &mut self.group {
-            *g = 0;
-        }
+        self.group.fill(0);
     }
 
     /// Run anti-entropy digests across all reachable pairs until convergence.
