@@ -387,12 +387,19 @@ impl MeshNode {
         // :0-resolved) port. Binding UDP first leaves a race where another
         // parallel test can claim the TCP port before we do; if the UDP bind
         // loses an ephemeral-port race, release the TCP reservation and retry.
+        // Bound retries and propagate other errors rather than hanging startup.
+        let mut attempts = 0;
         let (udp, listener, addr) = loop {
+            attempts += 1;
             let listener = TcpListener::bind(config.listen).await?;
             let addr = listener.local_addr()?;
             match UdpSocket::bind(addr).await {
                 Ok(udp) => break (Arc::new(udp), listener, addr),
-                Err(_error) if config.listen.port() == 0 => {
+                Err(error)
+                    if config.listen.port() == 0
+                        && error.kind() == std::io::ErrorKind::AddrInUse
+                        && attempts < 16 =>
+                {
                     drop(listener);
                     continue;
                 }
