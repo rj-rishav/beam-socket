@@ -49,13 +49,15 @@ fn spawn_bridge(
     let weak = Arc::downgrade(engine);
     engine.handle().spawn(async move {
         while let Some(ev) = rx.recv().await {
-            let Some(engine) = weak.upgrade() else { break };
             match ev {
                 EngineEvent::Authorize {
                     request_id,
                     headers,
                     ..
                 } => {
+                    // Only authorization needs the engine. Upgrading for close
+                    // events races the test's final Arc::try_unwrap teardown.
+                    let Some(engine) = weak.upgrade() else { break };
                     let user_id = headers
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("x-user"))
