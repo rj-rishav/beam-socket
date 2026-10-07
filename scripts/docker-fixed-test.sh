@@ -73,6 +73,8 @@ fi
 build_args=()
 [ -n "${RUST_IMAGE:-}" ] && build_args+=(--build-arg "RUST_IMAGE=$RUST_IMAGE")
 [ -n "${RUNTIME_IMAGE:-}" ] && build_args+=(--build-arg "RUNTIME_IMAGE=$RUNTIME_IMAGE")
+build_rev=$(git -C "$repo_root" rev-parse HEAD)
+build_args+=(--build-arg "BUILD_REV=$build_rev")
 
 # A failing phase does not stop later phases: a current-tree test failure
 # should still produce the end-to-end evaluation. The exit status reports it.
@@ -86,6 +88,7 @@ for phase in $phases; do
       echo "==> verify: previous=$baseline_ref vs current, cpus=$CPUS cpuset=$CPUSET memory=$MEMORY"
       docker run --rm "${limits[@]}" "${common_env[@]}" "${cache_mount[@]}" \
         --env BASELINE_REF="$baseline_ref" --env CURRENT_REF="${CURRENT_REF:-}" \
+        --env EXPECTED_BUILD_REV="$build_rev" \
         --mount "type=bind,src=$output_dir,dst=/results" \
         "$image:toolchain" || status=1
       ;;

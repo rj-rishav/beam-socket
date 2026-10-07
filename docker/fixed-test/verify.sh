@@ -16,12 +16,24 @@ CURRENT_DIR=$ROOT
 CACHE=${CACHE_DIR:-/cache}
 STATUS="$OUT/verify/status.tsv"
 
+# The public runner supplies the checkout revision used for docker build.
+# Reject a stale or mistagged image before testing or replacing any results.
+if [ -n "${EXPECTED_BUILD_REV:-}" ]; then
+  image_revision=$(cat /image-build-revision 2>/dev/null || true)
+  checkout_revision=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+  if [ "$image_revision" != "$EXPECTED_BUILD_REV" ] || [ "$checkout_revision" != "$EXPECTED_BUILD_REV" ]; then
+    echo "source revision mismatch: expected=$EXPECTED_BUILD_REV image=${image_revision:-missing} checkout=${checkout_revision:-missing}" >&2
+    exit 2
+  fi
+fi
+
 mkdir -p "$OUT/verify/logs" "$OUT/build" "$OUT/micro" "$CACHE"
 printf 'tree\tstep\tstatus\tseconds\tlog\n' > "$STATUS"
 
 record_environment() {
   {
     echo "phase=verify"
+    echo "image_build_revision=$(cat /image-build-revision 2>/dev/null || echo unknown)"
     echo "image_rust=${RUST_VERSION:-unknown}"
     echo "alpine=$(cat /etc/alpine-release)"
     echo "baseline_ref=$BASELINE_REF ($(git -C "$ROOT" rev-parse --short "$BASELINE_REF^{commit}" 2>/dev/null || echo missing))"

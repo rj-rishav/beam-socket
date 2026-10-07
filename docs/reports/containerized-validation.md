@@ -5,11 +5,12 @@
 Results on the shared development laptop drift with whatever else the machine
 is doing: the same build measured ±10–15% apart run to run (see
 `docs/reports/0.2.1-hardening.md`). This pipeline runs the previous and the
-current tree with an identical, fixed budget so that differences come from the
-code rather than the host:
+current tree with an identical, fixed budget to reduce resource-related drift.
+Host scheduling, interrupts and clock-frequency changes can still affect timing:
 
-- **2 CPUs, pinned:** `--cpuset-cpus` names two host CPUs (default `2,3`: not
-  CPU 0, two different physical cores) plus `--cpus=2`. A quota alone lets the
+- **2 logical CPUs, pinned:** `--cpuset-cpus` names two host CPUs (default `2,3`)
+  plus `--cpus=2`. They are on different physical cores on this laptop; set
+  `CPUSET` appropriately for another host's topology. A quota alone lets the
   work spread across every host core and get throttled in bursts.
 - **2 GiB memory, no swap:** `--memory=2g --memory-swap=2g`.
 - **Bounded processes and files:** `--pids-limit=1024`, `nofile=65536`.
@@ -61,9 +62,17 @@ silently reuse another commit's build. That happened once while building
 this pipeline: a `cc1d1ba` run linked `d961332`'s core. Prune old
 `target-ref-*` directories, or set `NO_CACHE=1`, when disk is tight.
 
+The wrapper passes the current Git revision as `BUILD_REV` to Docker and as
+`EXPECTED_BUILD_REV` to verification. The source layer is keyed by that revision,
+and verification rejects an image if its recorded revision or embedded checkout
+does not match the runner's checkout. The actual image revision is recorded in
+`verify/environment.txt`. Uncommitted source changes are still included by
+Docker's `COPY` instruction.
+
 CI: `.github/workflows/fixed-resources.yml` runs the same script on
 `ubuntu-latest`. It writes `evaluation.md` to the job summary and uploads the
-results, excluding staged builds. Hosted runners are shared VMs, so treat
+results, including the hidden `.artifacts` directory and excluding staged builds.
+Hosted runners are shared VMs, so treat
 their numbers as indicative and compare runs on the same host.
 
 ## Phases
@@ -106,58 +115,83 @@ The micro A/B gate (≥ 2× for 256+ exclusions, no cell > 10% slower) is
 reported but not enforced. One run cannot show a *repeatable* tiny-cell
 regression.
 
-## Results: 0.2.1 hardening vs previous (2026-10-01)
+## Version-control scope
 
-All runs: Alpine 3.24, Rust 1.97.1, Node 24.18.1, CPUs 2–3 of an i5-1135G7,
-2 GiB with no swap. Peak container memory in full runs was 0.53–0.64 GiB, with no OOM
-events and no failed runs. Raw data is under `.artifacts/` (local, not
-committed).
+This validation was prepared on branch `perf/0.2.1-hardening`:
 
-**Correctness (final run, `d961332` → working tree):** every step passes on
-both trees. Rust: 170 → **176** passed, 4 ignored. JS: 50 → **51** passed.
-Earlier runs exposed a flaky mesh test. `saturation.rs` failed 5/20 in the
-container because loopback kernel buffers (`tcp_rmem` max 32 MiB) absorbed
-its fixed 4 MB blast. It now saturates by observation and passed 30/30.
+- `main` / `d961332` is the previous-version reference;
+- `aee8323` is the current implementation and pipeline commit used for the
+  comparison;
+- the follow-up changes in this working branch harden image provenance and
+  documentation only; they do not change the Rust or TypeScript implementation
+  being evaluated.
 
-**Core fan-out micro A/B (musl, 2 CPUs, four runs):** large-exclusion
-speedups are up to 7.8×. The smallest qualifying cell (1,024 recipients / 256
-exclusions) ranges 1.75–2.42× across targets and distributions, so the
-"≥ 2×" gate is not met in every cell here. On the glibc laptop it was
-2.07–2.28×. Small indexed cells (1,024/32: 0.85–1.20×; 64/32: 0.91–1.13×)
-spread no more than cells that run identical code in both versions (1,024/0:
-0.91–1.15×; 1,024/1: 0.90–1.09×). That is single-cell noise under 2 CPUs,
-not a musl cost.
+Use `CURRENT_REF=<commit>` when comparing two committed trees, or omit it to
+test the working tree. The runner uses a full checkout because both
+`git archive` and the embedded source-revision check require the referenced
+objects to be available locally.
 
-**End-to-end, final run (8 paired rounds):**
+## Results: fixed-resource retest (`d961332` → `aee8323`, 2026-10-06)
+
+This run used the actual committed previous/current refs inside the container,
+not the host working tree. Verify used Alpine 3.24.1, bench used Alpine 3.24.2,
+Rust 1.97.1, Node 24.18.1, CPUs 2–3, 2 GiB with no swap. The bench phase
+reported a 612,794,368-byte peak and zero OOM events. Raw output is in
+`.artifacts/fixed-test-current/` locally; it is intentionally ignored by Git.
+
+**Correctness:** the current tree is green: **176 Rust tests passed, 0 failed,
+4 ignored; 51 JS tests passed**. The previous tree has **169 Rust tests passed,
+1 failed, 4 ignored; 50 JS tests passed**. The one previous failure is the old
+`crates/mesh/tests/saturation.rs` test: its fixed blast did not fill the
+sender pressure gauge under this 2-CPU loopback environment. The current tree's
+observation-based saturation test passes. This is recorded as a previous-version
+failure, not hidden or counted as a current regression.
+
+**Core fan-out micro A/B:** all 108 cells completed in one process, comparing
+the current implementation to its frozen pre-optimization implementation.
+Large-exclusion speedups were **1.99×–7.66×**. The minimum is one
+1,024-recipient / 256-exclusion cell at 1.99×, which misses the 2× target in
+this run. The micro gate is reported separately from correctness and does not
+fail the correctness phase. The worst all-cells result was a
+1,024-recipient / one-duplicate-exclusion cell at 0.94×.
+
+**End-to-end, six paired rounds, alternating order:**
 
 | Metric | Previous | Current | Paired Δ | Rounds better | Verdict |
 |---|---:|---:|---:|---:|---|
-| Idle memory / connection | 12,652 B | 9,201 B | **+27.4%** | 8/8 | improved |
-| Echo throughput 64 B | 51,421/s | 50,698/s | −1.1% | 2/8 | no clear change |
-| Echo throughput 16 KiB | 14,808/s | 14,329/s | −3.2% | 2/8 | no clear change |
-| Echo latency p50 / p99 | — | — | — | — | unstable (see below) |
-| Fan-out 1,000 / 3,000 | — | — | −0.9% / −1.3% | 4/8, 4/8 | no clear change |
-| Fan-out 5,000 | 51.8 ms | 56.3 ms | −8.7% | 1/8 | slower (gate −15%: pass) |
+| Idle memory / connection | 12,635 B | 9,279 B | **+26.1%** | 6/6 | improved |
+| Echo throughput 64 B | 51,386/s | 51,012/s | −0.5% | 3/6 | no clear change |
+| Echo throughput 16 KiB | 16,331/s | 16,151/s | −2.1% | 3/6 | no clear change |
+| Echo latency p50 | 2.516 ms | 1.860 ms | +14.9% | 4/6 | unstable, 3.5× spread |
+| Echo latency p99 | 4.739 ms | 4.756 ms | +5.8% | 4/6 | unstable, 1.6× spread |
+| Room fan-out 1,000 | 13.23 ms | 13.64 ms | −13.2% | 2/6 | unstable, 1.9× spread |
+| Room fan-out 3,000 | 28.505 ms | 29.200 ms | −2.9% | 3/6 | no clear change |
+| Room fan-out 5,000 | 51.715 ms | 49.910 ms | **+3.5%** | 5/6 | no clear change |
 
-Attribution (bisect runs with the same pipeline):
+The evaluator's end-to-end gate passed. The memory reduction is the measured
+effect of the 4 KiB → 1 KiB codec read-buffer change in this branch. The
+exclusion-index change is intentionally evaluated separately by the core micro
+A/B because the normal room benchmark sends to every member without a large
+`except` list. Throughput remains within the 10% gate; unstable latency and
+1,000-member fan-out are reported rather than converted into false claims.
 
-| Comparison | Memory | Fan-out 5,000 |
-|---|---|---|
-| `cc1d1ba` → working tree (read buffer only) | **+26.2%, 6/6** | −2.3%, 2/6 |
-| `d961332` → `cc1d1ba` (exclusions, push helper, empty frames) | −0.3%, 3/8 | −4.8%, 2/8 |
-| Fan-out 5,000 alone, `--only fanout`, 20 rounds | — | **+1.0%, 12/20** |
+### Image-provenance follow-up
 
-The memory win comes entirely from the 1 KiB read buffer. Fan-out to 5,000
-is slower only when it runs after the throughput and latency phases in the
-same process. In isolation it is unchanged. So the effect depends on state
-built up by earlier activity, and no code path explains it: the core enqueue
-is neutral in the micro A/B. It stays within the gate and is an open item.
+The public wrapper was run again with `PHASES=verify`, `CURRENT_REF=aee8323`,
+and no cache volumes after the revision check was added. It rebuilt the image
+with `image_build_revision=aee8323` and the check accepted the matching embedded
+checkout. Both previous and current correctness matrices passed in this
+follow-up: 170 Rust tests versus 176 Rust tests, 4 ignored in each, and 50
+versus 51 JavaScript tests. The micro benchmark completed all 108 cells; its
+large-exclusion range was 1.75×–6.95× and, as expected for a single noisy run,
+the micro gate was reported as not fully met. This follow-up was a provenance
+and correctness check only; it did not replace the six-round end-to-end result
+above.
 
-**Engine finding unrelated to this branch:** BeamSocket's echo p50 is
-bimodal under 2 CPUs in *both* trees. Runs land near 0.7 ms or near 2.7 ms,
-while `ws` stays at about 0.45 ms. The evaluator marks such metrics as
-unstable instead of judging them. That is the main reason this pipeline
-never reported a latency gate breach that would not reproduce.
+If `EXPECTED_BUILD_REV` does not match either `/image-build-revision` or the
+embedded checkout's `HEAD`, `verify.sh` exits with status 2 before creating
+test results. This prevents an old Docker image from being mistaken for a
+current comparison.
 
 ## Limitations
 

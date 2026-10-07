@@ -129,6 +129,7 @@ process.on('SIGTERM', () => io.close({ timeoutMs: 30_000 })); // drain, then exi
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design and the rules that govern it |
 | [docs/rfcs/0001-event-bridge.md](docs/rfcs/0001-event-bridge.md) | The frozen RFC gating all runtime work |
 | [docs/ENGINEERING.md](docs/ENGINEERING.md) | What to build, in what order, and how to know you're done |
+| [docs/reports/containerized-validation.md](docs/reports/containerized-validation.md) | Fixed-resource Alpine validation, previous/current A/B methodology and results |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 
 ## Layout

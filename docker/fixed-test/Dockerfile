@@ -12,6 +12,7 @@
 # same 2 CPU / 2 GiB / no-swap cgroup to every phase at `docker run` time.
 ARG RUST_IMAGE=rust:1.97.1-alpine3.24
 ARG RUNTIME_IMAGE=alpine:3.24
+ARG BUILD_REV=unknown
 
 FROM ${RUST_IMAGE} AS toolchain
 
@@ -40,6 +41,10 @@ ENV RUSTUP_TOOLCHAIN=${RUST_VERSION} \
     RUST_BACKTRACE=1
 
 WORKDIR /workspace
+# Include the checkout revision in the Docker cache key and record it for the
+# entrypoint's source-revision check. The runner rejects stale/mistagged images.
+ARG BUILD_REV
+RUN printf '%s\n' "$BUILD_REV" > /image-build-revision
 # Keep .git in the image: verify.sh extracts the exact previous tree with
 # `git archive`, so both trees are evaluated by the same image and toolchain.
 COPY . /workspace
