@@ -3,9 +3,12 @@
 All notable changes to the `beamsocket` npm package. This project follows
 [Semantic Versioning](https://semver.org/); pre-1.0 alphas may still move APIs.
 
-## Unreleased
+## 0.2.1 — 2026-10-08 (hardening: memory, backpressure, honest benchmarks)
 
 ### Fixed
+- **Cluster mesh binds TCP before UDP on an ephemeral port**, with bounded
+  retries. Binding UDP on `:0` and then TCP on the same port could fail with
+  `AddrInUse` on a busy host (many TIME_WAIT sockets).
 - **Relayed `toSocket` now honours the `Disconnect` backpressure policy.** A
   cross-node `socket.send` that overflowed a `Disconnect`-policy mailbox
   closed the queue without signalling a close, leaving a half-dead
@@ -31,6 +34,15 @@ All notable changes to the `beamsocket` npm package. This project follows
   throughput cost. Report: `docs/reports/0.2.1-hardening.md`.
 
 ### Changed
+- **Fixed-resource validation pipeline.** `scripts/docker-fixed-test.sh` runs
+  the full test matrix and a previous-vs-current end-to-end A/B in Alpine
+  containers pinned to 2 CPUs / 2 GiB (also a CI workflow). Under it, this
+  release vs 0.2.0: −27% idle memory per connection (8/8 rounds), echo
+  throughput unchanged, 176/176 Rust and 51/51 JS tests.
+  See `docs/reports/containerized-validation.md`.
+- **Test reliability:** the mesh saturation test no longer assumes kernel
+  socket buffers are smaller than 4 MB, and a core teardown test no longer
+  retains the engine.
 - **Benchmark harness: 16 KiB large-frame throughput gate.**
   `benchmarks/driver.mjs`'s `measureThroughput` now takes a `payload`
   argument; the driver runs it at the existing 64 B baseline and again at

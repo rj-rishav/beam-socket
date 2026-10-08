@@ -8,7 +8,7 @@ Rust data plane, JavaScript control plane. Maximum connections, minimum overhead
 npm install beamsocket@alpha
 ```
 
-> **Live on npm** (`0.1.0-alpha.0`, `alpha` tag). Prebuilt binaries for
+> **Live on npm** (`0.2.1`, `alpha` tag). Prebuilt binaries for
 > **linux-x64, macOS arm64, Windows x64** — no toolchain needed. Verified
 > end-to-end from the published package: install → boot a server → echo a
 > client. It's an alpha — single-node today, three platforms, headline perf
@@ -45,7 +45,15 @@ and single-node mode proven zero-cost (no mesh spawned, ~405 ns/verb, the 112
 pre-mesh tests unchanged). Rust core: 166 tests. See
 [ENGINEERING.md §13](docs/ENGINEERING.md).
 
-**Staged for `0.2.0` (branch `v0.2.0-cluster-js`, 2026-08-20):** clustering
+**`0.2.1` (2026-10-08):** about 23–27% less idle memory per connection
+(1 KiB codec read buffer), faster `.except()` fan-out for large exclusion
+lists, backpressure fixes (relayed `toSocket` honours `Disconnect`; empty
+frames are budgeted), and corrected 16 KiB benchmarks — validated by a
+fixed-resource previous-vs-current pipeline
+([report](docs/reports/containerized-validation.md),
+[CHANGELOG](CHANGELOG.md)).
+
+**`0.2.0` (2026-08-20):** clustering
 reaches JavaScript — a mesh forms from `new BeamSocket({ cluster: {...} })`
 alone, every targeting verb relays cross-node exactly once, `except()` and
 `toSocket()` are node-aware, and `io.stats().cluster` exposes membership and
